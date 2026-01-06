@@ -1,0 +1,51 @@
+name: mssql-env
+on:
+  workflow_dispatch:
+
+jobs:
+  env-check:
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2019-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: "Developer"
+          MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+        ports:
+          - 1433:1433
+
+    steps:
+      - name: Install sqlcmd (mssql-tools18)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl apt-transport-https gnupg
+          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc >/dev/null
+          curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list >/dev/null
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+          echo "/opt/mssql-tools18/bin" >> $GITHUB_PATH
+
+      - name: Wait for SQL Server
+        env:
+          SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+        run: |
+          for i in {1..60}; do
+            if sqlcmd -S localhost,1433 -U sa -P "$SA_PASSWORD" -Q "SELECT 1" -b >/dev/null 2>&1; then
+              echo "SQL Server is ready."
+              break
+            fi
+            sleep 2
+            if [ "$i" -eq 60 ]; then
+              echo "SQL Server not ready."
+              exit 1
+            fi
+          done
+
+      - name: Basic sanity check
+        env:
+          SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+        run: |
+          sqlcmd -S localhost,1433 -U sa -P "$SA_PASSWORD" -Q "SELECT @@VERSION AS Version;" -b
+          sqlcmd -S localhost,1433 -U sa -P "$SA_PASSWORD" -Q "IF DB_ID('TestDB') IS NULL CREATE DATABASE TestDB;" -b
+          sqlcmd -S localhost,1433 -U sa -P "$SA_PASSWORD" -Q "SELECT name FROM sys.databases WHERE name='TestDB';" -b
