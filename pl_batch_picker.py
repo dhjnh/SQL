@@ -789,18 +789,24 @@ class App:
         ttk.Label(frm, textvariable=self.progress_var).grid(row=8, column=0, columnspan=2, sticky="w")
         ttk.Label(frm, textvariable=self.pl_var).grid(row=9, column=0, columnspan=2, sticky="w")
         ttk.Label(frm, textvariable=self.runtime_var).grid(row=10, column=0, columnspan=2, sticky="w")
-        ttk.Label(frm, textvariable=self.log_var).grid(row=11, column=0, columnspan=2, sticky="w")
+        self.log_label = ttk.Label(frm, textvariable=self.log_var, justify="left", anchor="w", wraplength=900)
+        self.log_label.grid(row=11, column=0, columnspan=2, sticky="ew")
 
         self.progress = ttk.Progressbar(frm, orient="horizontal", mode="determinate", maximum=100)
         self.progress.grid(row=12, column=0, columnspan=2, sticky="ew", pady=(2, 4))
 
-        self.text = tk.Text(frm, width=100, height=18)
+        self.text = tk.Text(frm, width=100, height=18, wrap="word")
         self.text.grid(row=13, column=0, columnspan=2, sticky="nsew")
         frm.columnconfigure(1, weight=1)
+        self.root.bind("<Configure>", self._on_resize)
         self.reload_kb()
 
     def ui(self, fn):
         self.root.after(0, fn)
+
+    def _on_resize(self, _event=None):
+        width = max(300, self.root.winfo_width() - 40)
+        self.log_label.configure(wraplength=width)
 
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
