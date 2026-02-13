@@ -99,6 +99,7 @@ def load_kb(path: str = "kb") -> Dict[str, Any]:
         "score_value_weight": 0.10,
         "gpg_delta_min": -4,
         "gpg_delta_max": 10,
+        "penalty_default": -0.2,
     }
     kb: Dict[str, Any] = {
         "kb_name": "fallback-kb",
@@ -117,9 +118,10 @@ def load_kb(path: str = "kb") -> Dict[str, Any]:
         "pl_adjacency": {},
         "pl_light_map": {},
         "pl_enabled": False,
-        "category_alias": {},
         "weak_token_weight": {},
         "strong_token_weight": {},
+        "phrase_trie": {},
+        "category_domain_map": {},
     }
 
     root = Path(path)
@@ -176,6 +178,7 @@ def load_kb(path: str = "kb") -> Dict[str, Any]:
     concept_map: Dict[str, str] = {}
     weight_map: Dict[str, float] = {}
     norm_to_concepts: Dict[str, Set[str]] = {}
+    phrase_trie: Dict[str, Any] = {}
     for r in _read_csv_dicts(syn_path):
         term = _norm_text(r.get("term"))
         if not term:
@@ -183,9 +186,17 @@ def load_kb(path: str = "kb") -> Dict[str, Any]:
         norm = _norm_text(r.get("norm")) or term
         concept = _norm_text(r.get("concept"))
         weight = _safe_float(r.get("weight"), 1.0)
-        norm_map[term] = norm
-        concept_map[term] = concept
-        weight_map[term] = weight
+        term_tokens = _tokens(term)
+        if len(term_tokens) == 1:
+            norm_map[term_tokens[0]] = norm
+        if term_tokens:
+            node = phrase_trie
+            for tok in term_tokens:
+                node = node.setdefault(tok, {})
+            node["_norm"] = norm
+        if concept:
+            concept_map[norm] = concept
+        weight_map[norm] = max(weight_map.get(norm, 0.0), weight)
         norm_to_concepts.setdefault(norm, set())
         if concept:
             norm_to_concepts[norm].add(concept)
@@ -201,16 +212,23 @@ def load_kb(path: str = "kb") -> Dict[str, Any]:
         adjacency.setdefault(b, []).append((a, s))
 
     guard: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    penalty_default = _safe_float((manifest.get("scoring_defaults") or {}).get("penalty_default"), _safe_float(default_scoring.get("penalty_default"), -0.2))
     for r in _read_csv_dicts(guard_path):
         cat = _norm_text(r.get("new_category"))
         dom = _norm_text(r.get("old_url_domain"))
         if not cat or not dom:
             continue
-        p = _safe_float(r.get("penalty"), 0.0)
+        mode = _norm_text(r.get("mode")) or "allow"
+        raw_pen = _to_text(r.get("penalty"))
+        if mode == "penalize":
+            p = _safe_float(raw_pen, penalty_default) if raw_pen != "" else penalty_default
+            if p > 0:
+                p = -p
+        else:
+            p = _safe_float(raw_pen, 0.0)
         guard[(cat, dom)] = {
-            "mode": _norm_text(r.get("mode")) or "allow",
-            # 关键修复：兼容 KB 里负数惩罚，统一转为正惩罚幅度
-            "penalty": (-p if p < 0 else p),
+            "mode": mode,
+            "penalty": p,
             "note": _to_text(r.get("note")),
         }
 
@@ -252,24 +270,28 @@ def load_kb(path: str = "kb") -> Dict[str, Any]:
             )
         )
 
-    category_alias: Dict[str, str] = {}
+    category_domain_map: Dict[str, str] = {}
     for r in _read_csv_dicts(alias_path):
-        raw = _norm_text(r.get("raw"))
-        canon = _norm_text(r.get("canon"))
-        if raw and canon:
-            category_alias[raw] = canon
+        raw = _norm_text(r.get("raw_category"))
+        canon_domain = _norm_text(r.get("canon_domain"))
+        if raw and canon_domain:
+            category_domain_map[raw] = canon_domain
+
+    rule_norm_kb = {"norm_map": norm_map, "phrase_trie": phrase_trie}
 
     weak_token_weight: Dict[str, float] = {}
     for r in _read_csv_dicts(weak_tokens_path):
-        term = _norm_text(r.get("term"))
-        if term:
-            weak_token_weight[term] = _safe_float(r.get("weight"), 0.2)
+        token = _to_text(r.get("token"))
+        token_normed = _normalize_tokens(token, rule_norm_kb)
+        if token_normed:
+            weak_token_weight[token_normed[0]] = _safe_float(r.get("weight"), 0.2)
 
     strong_token_weight: Dict[str, float] = {}
     for r in _read_csv_dicts(strong_tokens_path):
-        term = _norm_text(r.get("term"))
-        if term:
-            strong_token_weight[term] = _safe_float(r.get("weight"), 2.0)
+        token = _to_text(r.get("token"))
+        token_normed = _normalize_tokens(token, rule_norm_kb)
+        if token_normed:
+            strong_token_weight[token_normed[0]] = _safe_float(r.get("weight"), 2.0)
 
     kb.update(
         {
@@ -285,9 +307,10 @@ def load_kb(path: str = "kb") -> Dict[str, Any]:
             "pl_adjacency": pl_adjacency,
             "pl_light_map": pl_light_map,
             "pl_enabled": bool(pl_norm_map or pl_adjacency or pl_light_map),
-            "category_alias": category_alias,
+            "category_domain_map": category_domain_map,
             "weak_token_weight": weak_token_weight,
             "strong_token_weight": strong_token_weight,
+            "phrase_trie": phrase_trie,
         }
     )
     if tmp_dir:
@@ -297,7 +320,32 @@ def load_kb(path: str = "kb") -> Dict[str, Any]:
 
 def _normalize_tokens(text: str, kb: Dict[str, Any]) -> List[str]:
     norm_map: Dict[str, str] = kb.get("norm_map", {})
-    return [norm_map.get(t, t) for t in _tokens(text)]
+    phrase_trie: Dict[str, Any] = kb.get("phrase_trie", {})
+    base = _tokens(text)
+    if not base:
+        return []
+    out: List[str] = []
+    i = 0
+    while i < len(base):
+        node = phrase_trie
+        j = i
+        best_norm = ""
+        best_j = i
+        while j < len(base) and isinstance(node, dict) and base[j] in node:
+            node = node[base[j]]
+            j += 1
+            hit = node.get("_norm") if isinstance(node, dict) else ""
+            if hit:
+                best_norm = _norm_text(hit)
+                best_j = j
+        if best_norm:
+            out.append(best_norm)
+            i = best_j
+            continue
+        tok = base[i]
+        out.append(norm_map.get(tok, tok))
+        i += 1
+    return out
 
 
 def _concepts_from_tokens(tokens: Sequence[str], kb: Dict[str, Any]) -> Set[str]:
@@ -342,9 +390,11 @@ def _category_state_from_guard(category: str, old_domain: str, kb: Dict[str, Any
     mode = _norm_text(rec.get("mode"))
     penalty = _safe_float(rec.get("penalty"), 0.0)
     if mode == "deny":
-        return "HARD-FAIL", max(0.0, penalty)
+        return "HARD-FAIL", penalty
     if mode == "penalize":
-        return "UNCERTAIN", max(0.0, penalty)
+        if penalty > 0:
+            penalty = -penalty
+        return "UNCERTAIN", penalty
     return "PASS", 0.0
 
 
@@ -395,10 +445,13 @@ def safe_percentiles(values: List[float]) -> List[int]:
 
 
 def _extract_object_phrase(text: str) -> str:
-    relation_terms = ["for", "with", "used", "used for", "w", "of"]
+    relation_terms = ["used for", "for", "with", "used", "w/", "of"]
     rels = sorted(relation_terms, key=len, reverse=True)
     for r in rels:
-        m = re.search(rf"\b{re.escape(r)}\b\s+([a-z0-9\-\s]{{2,60}})", text)
+        if r == "w/":
+            m = re.search(r"\bw/\s*([a-z0-9\-\s]{2,60}?)(?=,|\(|;|$)", text)
+        else:
+            m = re.search(rf"\b{re.escape(r)}\b\s+([a-z0-9\-\s]{{2,60}}?)(?=,|\(|;|$)", text)
         if m:
             return m.group(1).strip()
     return ""
@@ -408,7 +461,6 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
     value_scores = safe_percentiles([_safe_float(r.get("value1"), 0.0) for r in rows])
     row_scores: List[RowScore] = []
 
-    category_alias = kb.get("category_alias", {})
     tok_cache: Dict[str, List[str]] = {}
     gpg_tok_cache: Dict[str, List[str]] = {}
     concept_cache: Dict[Tuple[str, ...], Set[str]] = {}
@@ -450,7 +502,7 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         gpg = _to_text(row.get("SubCategory_GPG")).lower()
         subcategory = _to_text(row.get("SubCategory"))
         category_raw = _to_text(row.get("Category"))
-        category = category_alias.get(_norm_text(category_raw), _norm_text(category_raw))
+        category = category_raw
 
         desc_tokens = _tok_cached(desc_all)
         desc_concepts = _concept_cached(desc_tokens)
@@ -480,7 +532,7 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         else:
             d_state = "OUT"
 
-        generic_fastener = "generic_fastener" in desc_concepts or any(t in desc_tokens for t in ["bolt", "nut", "screw", "washer", "fastener"])
+        generic_fastener = "generic_fastener" in desc_concepts or any(t in desc_tokens for t in ["bolt", "nut", "screw", "washer", "fastener", "clip", "clamp", "rivet", "retainer", "pin"])
         sub_fastener = any(t in {"fastener", "bolt", "nut", "screw", "washer"} for t in sub_tokens)
 
         score_desc = 35
@@ -498,7 +550,8 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
                 score_desc += 4
         else:
             score_desc -= 4
-        score_desc -= int(round(guard_penalty))
+        if c_state == "UNCERTAIN" and guard_penalty < 0:
+            score_desc = int(round(score_desc * max(0.0, 1.0 + guard_penalty)))
         score_desc = max(0, min(100, score_desc))
 
         term_base = 25 + min(40, int(round(w_overlap * 10 + c_overlap * 15 + near * 6)))
@@ -534,7 +587,10 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
                         best_penalty = max(best_penalty, int(round(pl_max_penalty * s)))
             pl_delta = best_bonus if best_bonus > 0 else -best_penalty
 
-        score_term = max(0, min(100, term_base + gpg_delta + pl_delta - int(round(guard_penalty / 2))))
+        score_term = term_base + gpg_delta + pl_delta
+        if c_state == "UNCERTAIN" and guard_penalty < 0:
+            score_term = int(round(score_term * max(0.0, 1.0 + guard_penalty * 0.8)))
+        score_term = max(0, min(100, score_term))
         score_value = value_scores[i]
 
         w_desc = float(kb["scoring_defaults"].get("score_desc_weight", 0.60))
@@ -557,17 +613,35 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
             conf *= 0.85
         elif c_state == "HARD-FAIL":
             conf *= 0.20
-        conf *= max(0.0, 1.0 - guard_penalty / 18)
+        conf *= max(0.0, 1.0 + guard_penalty)
         if generic_fastener and not has_object:
             conf *= 0.60
         if generic_fastener and (not sub_fastener):
             conf *= 0.80
         conf = max(0.0, min(1.0, conf))
 
-        like = round(1 + conf * (like_raw - 1))
+        generic_no_object = generic_fastener and not has_object
+        hard_mismatch = (
+            d_state == "OUT"
+            and (not generic_fastener)
+            and w_overlap < 0.3
+            and c_overlap == 0
+            and near < 0.8
+            and gpg_overlap == 0
+            and gpg_near < 1.2
+        )
+
+        base = {"HIT": 0.75, "NEAR": 0.60, "OUT": 0.45}.get(d_state, 0.45)
+        factor = base + (1.0 - base) * conf
+        like = round(like_raw * factor)
         like = max(1, min(100, like))
         if c_state == "HARD-FAIL":
             like = min(like, 15)
+        if hard_mismatch:
+            like = min(like, 8)
+        if generic_no_object and d_state == "OUT" and (not hard_mismatch):
+            like = max(like, 12)
+            like = min(like, 35)
 
         row_scores.append(
             RowScore(
