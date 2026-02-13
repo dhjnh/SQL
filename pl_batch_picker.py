@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import tempfile
+import time
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
@@ -407,24 +408,38 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
     value_scores = safe_percentiles([_safe_float(r.get("value1"), 0.0) for r in rows])
     row_scores: List[RowScore] = []
 
+    category_alias = kb.get("category_alias", {})
+    tok_cache: Dict[str, List[str]] = {}
+    concept_cache: Dict[Tuple[str, ...], Set[str]] = {}
+
+    def _tok_cached(text: str) -> List[str]:
+        if text not in tok_cache:
+            tok_cache[text] = _normalize_tokens(text, kb)
+        return tok_cache[text]
+
+    def _concept_cached(tokens: List[str]) -> Set[str]:
+        key = tuple(tokens)
+        if key not in concept_cache:
+            concept_cache[key] = _concepts_from_tokens(tokens, kb)
+        return concept_cache[key]
+
     for i, row in enumerate(rows):
         desc_all = f"{_to_text(row.get('PNCDesc'))} {_to_text(row.get('PartDescription'))}".strip().lower()
         gpg = _to_text(row.get("SubCategory_GPG")).lower()
         subcategory = _to_text(row.get("SubCategory"))
         category_raw = _to_text(row.get("Category"))
-        category_alias = kb.get("category_alias", {})
         category = category_alias.get(_norm_text(category_raw), _norm_text(category_raw))
 
-        desc_tokens = _normalize_tokens(desc_all, kb)
-        desc_concepts = _concepts_from_tokens(desc_tokens, kb)
+        desc_tokens = _tok_cached(desc_all)
+        desc_concepts = _concept_cached(desc_tokens)
         gpg_tokens = _clean_gpg_tokens(gpg, kb)
-        gpg_concepts = _concepts_from_tokens(gpg_tokens, kb)
-        sub_tokens = _normalize_tokens(subcategory.lower(), kb)
-        sub_concepts = _concepts_from_tokens(sub_tokens, kb)
+        gpg_concepts = _concept_cached(gpg_tokens)
+        sub_tokens = _tok_cached(subcategory.lower())
+        sub_concepts = _concept_cached(sub_tokens)
 
         obj = _extract_object_phrase(desc_all)
-        obj_tokens = _normalize_tokens(obj, kb)
-        obj_concepts = _concepts_from_tokens(obj_tokens, kb)
+        obj_tokens = _tok_cached(obj)
+        obj_concepts = _concept_cached(obj_tokens)
         has_object = bool(obj_tokens)
 
         old_domain = _infer_old_domain(gpg_tokens)
@@ -944,6 +959,7 @@ class App:
             full_10_count = 0
             empty_pl_count = 0
 
+            run_start = time.perf_counter()
             for i, q in enumerate(queue_rows, start=1):
                 if not self._wait_if_paused_or_stop():
                     self.log("Stopped by user")
@@ -952,8 +968,17 @@ class App:
                 if q["status"] == "DONE":
                     processed += 1
                     continue
+                elapsed = max(0.0, time.perf_counter() - run_start)
+                done_cnt = max(0, i - 1)
+                avg_sec = (elapsed / done_cnt) if done_cnt else 0.0
+                remain = max(0, total - done_cnt)
+                eta_sec = int(round(avg_sec * remain)) if done_cnt else 0
+                h1, rem1 = divmod(int(elapsed), 3600)
+                m1, s1 = divmod(rem1, 60)
+                h2, rem2 = divmod(eta_sec, 3600)
+                m2, s2 = divmod(rem2, 60)
                 key = (q["VehicleId_Motor"], q["Category"], q["SubCategory"])
-                self.ui(lambda i=i, total=total, key=key, rc=q['row_cnt']: self.pl_var.set(f"PL: {i}/{total} {key} rows={rc}"))
+                self.ui(lambda i=i, total=total, key=key, rc=q['row_cnt'], et=f"{h1:02d}:{m1:02d}:{s1:02d}", eta=f"{h2:02d}:{m2:02d}:{s2:02d}": self.pl_var.set(f"PL: {i}/{total} {key} rows={rc} | elapsed={et} | eta={eta}"))
                 try:
                     with conn.cursor(as_dict=True) as cur:
                         cur.execute(
