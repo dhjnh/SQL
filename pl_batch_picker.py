@@ -410,7 +410,10 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
 
     category_alias = kb.get("category_alias", {})
     tok_cache: Dict[str, List[str]] = {}
+    gpg_tok_cache: Dict[str, List[str]] = {}
     concept_cache: Dict[Tuple[str, ...], Set[str]] = {}
+    overlap_cache: Dict[Tuple[Tuple[str, ...], Tuple[str, ...]], float] = {}
+    near_cache: Dict[Tuple[Tuple[str, ...], Tuple[str, ...]], float] = {}
 
     def _tok_cached(text: str) -> List[str]:
         if text not in tok_cache:
@@ -423,6 +426,25 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
             concept_cache[key] = _concepts_from_tokens(tokens, kb)
         return concept_cache[key]
 
+    def _gpg_tok_cached(text: str) -> List[str]:
+        if text not in gpg_tok_cache:
+            gpg_tok_cache[text] = _clean_gpg_tokens(text, kb)
+        return gpg_tok_cache[text]
+
+    def _weighted_overlap_cached(desc_tokens: List[str], sub_tokens: List[str]) -> float:
+        key = (tuple(desc_tokens), tuple(sub_tokens))
+        if key not in overlap_cache:
+            overlap_cache[key] = _weighted_overlap(desc_tokens, sub_tokens, kb)
+        return overlap_cache[key]
+
+    def _near_cached(desc_concepts: Set[str], sub_concepts: Set[str]) -> float:
+        ka = tuple(sorted(desc_concepts))
+        kb2 = tuple(sorted(sub_concepts))
+        key = (ka, kb2) if ka <= kb2 else (kb2, ka)
+        if key not in near_cache:
+            near_cache[key] = _concept_link_score(desc_concepts, sub_concepts, kb)
+        return near_cache[key]
+
     for i, row in enumerate(rows):
         desc_all = f"{_to_text(row.get('PNCDesc'))} {_to_text(row.get('PartDescription'))}".strip().lower()
         gpg = _to_text(row.get("SubCategory_GPG")).lower()
@@ -432,7 +454,7 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
 
         desc_tokens = _tok_cached(desc_all)
         desc_concepts = _concept_cached(desc_tokens)
-        gpg_tokens = _clean_gpg_tokens(gpg, kb)
+        gpg_tokens = _gpg_tok_cached(gpg)
         gpg_concepts = _concept_cached(gpg_tokens)
         sub_tokens = _tok_cached(subcategory.lower())
         sub_concepts = _concept_cached(sub_tokens)
@@ -445,9 +467,9 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         old_domain = _infer_old_domain(gpg_tokens)
         c_state, guard_penalty = _category_state_from_guard(category, old_domain, kb)
 
-        w_overlap = _weighted_overlap(desc_tokens, sub_tokens, kb)
+        w_overlap = _weighted_overlap_cached(desc_tokens, sub_tokens)
         c_overlap = len(desc_concepts & sub_concepts)
-        near = _concept_link_score(desc_concepts, sub_concepts, kb)
+        near = _near_cached(desc_concepts, sub_concepts)
 
         if c_state == "HARD-FAIL":
             d_state = "OUT"
@@ -459,7 +481,7 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
             d_state = "OUT"
 
         generic_fastener = "generic_fastener" in desc_concepts or any(t in desc_tokens for t in ["bolt", "nut", "screw", "washer", "fastener"])
-        sub_fastener = "fastener" in " ".join(sub_tokens)
+        sub_fastener = any(t in {"fastener", "bolt", "nut", "screw", "washer"} for t in sub_tokens)
 
         score_desc = 35
         if c_state == "PASS":
@@ -640,10 +662,15 @@ class App:
         self.log_var = tk.StringVar(value="Ready")
         self.progress_var = tk.StringVar(value="Stage: idle")
         self.pl_var = tk.StringVar(value="PL: 0/0")
+        self.runtime_var = tk.StringVar(value="Elapsed: 00:00:00 | ETA: --:--:--")
         self.running = False
         self.pause_event = threading.Event()
         self.stop_requested = False
         self.worker_thread = None
+        self.clock_running = False
+        self.clock_start = 0.0
+        self.clock_done = 0
+        self.clock_total = 0
 
         frm = ttk.Frame(root, padding=8)
         frm.grid(sticky="nsew")
@@ -687,13 +714,14 @@ class App:
         ttk.Button(ctl_row, text="Stop", command=self.stop_run).grid(row=0, column=4)
         ttk.Label(frm, textvariable=self.progress_var).grid(row=8, column=0, columnspan=2, sticky="w")
         ttk.Label(frm, textvariable=self.pl_var).grid(row=9, column=0, columnspan=2, sticky="w")
-        ttk.Label(frm, textvariable=self.log_var).grid(row=10, column=0, columnspan=2, sticky="w")
+        ttk.Label(frm, textvariable=self.runtime_var).grid(row=10, column=0, columnspan=2, sticky="w")
+        ttk.Label(frm, textvariable=self.log_var).grid(row=11, column=0, columnspan=2, sticky="w")
 
         self.progress = ttk.Progressbar(frm, orient="horizontal", mode="determinate", maximum=100)
-        self.progress.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(2, 4))
+        self.progress.grid(row=12, column=0, columnspan=2, sticky="ew", pady=(2, 4))
 
         self.text = tk.Text(frm, width=100, height=18)
-        self.text.grid(row=12, column=0, columnspan=2, sticky="nsew")
+        self.text.grid(row=13, column=0, columnspan=2, sticky="nsew")
         frm.columnconfigure(1, weight=1)
         self.reload_kb()
 
@@ -720,6 +748,41 @@ class App:
             self.progress.stop()
             self.progress.configure(mode="determinate", maximum=max(1, total), value=max(0, min(current, total)))
         self.ui(_u)
+
+    def _start_runtime_clock(self, total: int):
+        self.clock_running = True
+        self.clock_start = time.perf_counter()
+        self.clock_done = 0
+        self.clock_total = max(0, int(total))
+        self.ui(lambda: self.runtime_var.set("Elapsed: 00:00:00 | ETA: --:--:--"))
+        self.root.after(1000, self._tick_runtime_clock)
+
+    def _update_runtime_clock(self, done: int):
+        self.clock_done = max(0, int(done))
+
+    def _stop_runtime_clock(self):
+        self.clock_running = False
+        self.clock_done = 0
+        self.clock_total = 0
+        self.ui(lambda: self.runtime_var.set("Elapsed: 00:00:00 | ETA: --:--:--"))
+
+    def _tick_runtime_clock(self):
+        if not self.clock_running:
+            return
+        elapsed = max(0.0, time.perf_counter() - self.clock_start)
+        done = max(0, self.clock_done)
+        total = max(0, self.clock_total)
+        eta_txt = "--:--:--"
+        if done > 0 and total >= done:
+            avg = elapsed / done
+            eta_sec = max(0, int(round(avg * (total - done))))
+            h2, rem2 = divmod(eta_sec, 3600)
+            m2, s2 = divmod(rem2, 60)
+            eta_txt = f"{h2:02d}:{m2:02d}:{s2:02d}"
+        h1, rem1 = divmod(int(elapsed), 3600)
+        m1, s1 = divmod(rem1, 60)
+        self.runtime_var.set(f"Elapsed: {h1:02d}:{m1:02d}:{s1:02d} | ETA: {eta_txt}")
+        self.root.after(1000, self._tick_runtime_clock)
 
     def browse_kb(self):
         chosen_dir = filedialog.askdirectory(title="Select KB folder (contains kb_manifest.json)")
@@ -845,6 +908,10 @@ class App:
             self.pause_event.clear()
             self.running = False
             self.worker_thread = None
+        self.clock_running = False
+        self.clock_start = 0.0
+        self.clock_done = 0
+        self.clock_total = 0
 
     def _validate_required_columns(self, conn, schema: str, table_name: str) -> Dict[str, str]:
         required = [
@@ -959,7 +1026,7 @@ class App:
             full_10_count = 0
             empty_pl_count = 0
 
-            run_start = time.perf_counter()
+            self._start_runtime_clock(total)
             for i, q in enumerate(queue_rows, start=1):
                 if not self._wait_if_paused_or_stop():
                     self.log("Stopped by user")
@@ -967,18 +1034,11 @@ class App:
                 stop_pl = False
                 if q["status"] == "DONE":
                     processed += 1
+                    self._update_runtime_clock(i)
                     continue
-                elapsed = max(0.0, time.perf_counter() - run_start)
-                done_cnt = max(0, i - 1)
-                avg_sec = (elapsed / done_cnt) if done_cnt else 0.0
-                remain = max(0, total - done_cnt)
-                eta_sec = int(round(avg_sec * remain)) if done_cnt else 0
-                h1, rem1 = divmod(int(elapsed), 3600)
-                m1, s1 = divmod(rem1, 60)
-                h2, rem2 = divmod(eta_sec, 3600)
-                m2, s2 = divmod(rem2, 60)
+                self._update_runtime_clock(i - 1)
                 key = (q["VehicleId_Motor"], q["Category"], q["SubCategory"])
-                self.ui(lambda i=i, total=total, key=key, rc=q['row_cnt'], et=f"{h1:02d}:{m1:02d}:{s1:02d}", eta=f"{h2:02d}:{m2:02d}:{s2:02d}": self.pl_var.set(f"PL: {i}/{total} {key} rows={rc} | elapsed={et} | eta={eta}"))
+                self.ui(lambda i=i, total=total, key=key, rc=q['row_cnt']: self.pl_var.set(f"PL: {i}/{total} {key} rows={rc}"))
                 try:
                     with conn.cursor(as_dict=True) as cur:
                         cur.execute(
@@ -1055,13 +1115,17 @@ class App:
                     q["processed_at"] = datetime.now().isoformat(timespec="seconds")
                     q["notes"] = ""
                     processed += 1
+                    self._update_runtime_clock(i)
                 except Exception as e:
                     q["status"] = "FAIL"
                     q["notes"] = str(e)[:240]
                     conn.rollback()
+                    self._update_runtime_clock(i)
                 self.set_progress_value(i, total)
                 self._save_queue(queue_file, queue_rows)
 
+            self._update_runtime_clock(total)
+            self._stop_runtime_clock()
             self.set_progress_indeterminate(False)
             self._save_queue(queue_file, queue_rows)
             avg_pick = round(selected_count / total, 2) if total else 0
