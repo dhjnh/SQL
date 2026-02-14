@@ -170,9 +170,9 @@ def load_kb(path: str = "kb") -> Dict[str, Any]:
     pl_syn_path = kb_root / extras.get("pl_synonyms", "lexicon/pl_synonyms.csv")
     pl_link_path = kb_root / extras.get("pl_concept_links", "lexicon/pl_concept_links.csv")
     pl_map_path = kb_root / extras.get("pl_light_match_map", "rules/pl_light_match_map.csv")
-    alias_path = kb_root / "rules/category_aliases.csv"
-    weak_tokens_path = kb_root / "rules/weak_tokens.csv"
-    strong_tokens_path = kb_root / "rules/strong_tokens.csv"
+    alias_path = kb_root / extras.get("category_aliases", "rules/category_aliases.csv")
+    weak_tokens_path = kb_root / extras.get("weak_tokens", "rules/weak_tokens.csv")
+    strong_tokens_path = kb_root / extras.get("strong_tokens", "rules/strong_tokens.csv")
 
     norm_map: Dict[str, str] = {}
     concept_map: Dict[str, str] = {}
@@ -244,8 +244,13 @@ def load_kb(path: str = "kb") -> Dict[str, Any]:
         term = _norm_text(r.get("term"))
         if not term:
             continue
-        pl_norm_map[term] = _norm_text(r.get("norm")) or term
-        pl_concept_map[term] = _norm_text(r.get("pl_concept"))
+        norm = _norm_text(r.get("norm")) or term
+        pl_concept = _norm_text(r.get("pl_concept"))
+        pl_norm_map[term] = norm
+        pl_norm_map[norm] = norm
+        if pl_concept:
+            pl_concept_map[norm] = pl_concept
+            pl_concept_map[term] = pl_concept
 
     pl_adjacency: Dict[str, List[Tuple[str, float]]] = {}
     for r in _read_csv_dicts(pl_link_path):
@@ -368,7 +373,7 @@ def _clean_gpg_tokens(gpg: str, kb: Dict[str, Any]) -> List[str]:
     return [t for t in raw if t and t not in stopwords]
 
 
-def _infer_old_domain(gpg_tokens: Sequence[str]) -> str:
+def _infer_old_domain(gpg_tokens: Sequence[str], category: str = "", kb: Optional[Dict[str, Any]] = None) -> str:
     txt = " ".join(gpg_tokens)
     if any(k in txt for k in ["engine", "fuel", "tool"]):
         return "engine_fuel_tool"
@@ -380,6 +385,10 @@ def _infer_old_domain(gpg_tokens: Sequence[str]) -> str:
         return "body"
     if any(k in txt for k in ["fastener", "bolt", "nut", "screw", "washer"]):
         return "fasteners"
+    if kb and category:
+        dom = (kb.get("category_domain_map", {}) or {}).get(str(category).strip().lower(), "")
+        if dom:
+            return dom
     return "unknown"
 
 
@@ -516,7 +525,7 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         obj_concepts = _concept_cached(obj_tokens)
         has_object = bool(obj_tokens)
 
-        old_domain = _infer_old_domain(gpg_tokens)
+        old_domain = _infer_old_domain(gpg_tokens, category=category, kb=kb)
         c_state, guard_penalty = _category_state_from_guard(category, old_domain, kb)
 
         w_overlap = _weighted_overlap_cached(desc_tokens, sub_tokens)
