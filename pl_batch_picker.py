@@ -731,6 +731,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("PL Batch Like/ispick Processor")
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
         self.kb_path = tk.StringVar(value="kb")
         self.kb = load_kb(self.kb_path.get())
         self.log_var = tk.StringVar(value="Ready")
@@ -798,6 +800,9 @@ class App:
         self.text = tk.Text(frm, width=100, height=18, wrap="word")
         self.text.grid(row=13, column=0, columnspan=2, sticky="nsew")
         frm.columnconfigure(1, weight=1)
+        frm.rowconfigure(13, weight=1)
+        self.root.update_idletasks()
+        self.root.minsize(max(980, frm.winfo_reqwidth() + 16), max(620, frm.winfo_reqheight() + 16))
         self.root.bind("<Configure>", self._on_resize)
         self.reload_kb()
 
