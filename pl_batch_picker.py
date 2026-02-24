@@ -528,7 +528,9 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         obj_concepts = _concept_cached(obj_tokens)
         has_object = bool(obj_tokens)
 
-        old_domain = _infer_old_domain(gpg_tokens, category=category, kb=kb)
+        gpg_parts = [x.strip() for x in re.split(r"[\/]+", gpg) if x.strip()]
+        old_domain = _norm_text(gpg_parts[0]) if gpg_parts else _infer_old_domain(gpg_tokens, category=category, kb=kb)
+        gpg_last_token = _norm_text(gpg_parts[-1].replace("-", " ").replace("_", " ")) if gpg_parts else ""
         c_state, guard_penalty = _category_state_from_guard(category, old_domain, kb)
 
         pnc_text = _to_text(row.get("PNCDesc")).lower()
@@ -629,22 +631,21 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
             pl_delta = best_bonus if best_bonus > 0 else -best_penalty
 
         context_adjust = 0
-        if generic_no_subject:
-            pl_map = kb.get("pl_light_map", {})
-            cat_n = _norm_text(category)
-            sub_n = _norm_text(subcategory)
-            gpg_last = ""
-            if gpg:
-                gpg_last_raw = re.split(r"[\/]+", gpg)[-1].strip()
-                gpg_last = _norm_text(gpg_last_raw.replace("-", " ").replace(" ", "_"))
-            cand = list(pl_map.get(gpg_last, [])) if gpg_last else []
-            if cand:
-                if any(m_cat == cat_n and m_sub == sub_n for m_cat, m_sub, _ in cand):
-                    context_adjust = 6
-                elif any(m_cat == cat_n for m_cat, _m_sub, _ in cand):
-                    context_adjust = 3
-                else:
-                    context_adjust = -4
+        curr_score = 0.0
+        best_score = 0.0
+        pl_map = kb.get("pl_light_map", {})
+        cat_n = _norm_text(category)
+        sub_n = _norm_text(subcategory)
+        cand = list(pl_map.get(gpg_last_token, [])) if gpg_last_token else []
+        if cand:
+            best_score = max(_safe_float(x[2], 0.0) for x in cand)
+            curr_score = max((_safe_float(sc, 0.0) for m_cat, m_sub, sc in cand if m_cat == cat_n and m_sub == sub_n), default=0.0)
+            if curr_score > 0 and abs(curr_score - best_score) < 1e-9:
+                context_adjust += 6
+            elif curr_score > 0 and curr_score < best_score:
+                context_adjust -= 1
+            elif curr_score == 0 and best_score > 0:
+                context_adjust -= 4
         score_term = term_base + gpg_delta + pl_delta + context_adjust
         if c_state == "UNCERTAIN" and guard_penalty < 0:
             score_term = int(round(score_term * max(0.0, 1.0 + guard_penalty * 0.8)))
@@ -704,6 +705,13 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
                 like = min(like, 16)
             elif context_adjust < 0:
                 like = min(like, 6)
+
+        has_strong_hit = any(t in strong_tokens for t in desc_tokens)
+        low_evidence = ((score_desc + score_term) < 85) or ((not has_strong_hit) and len(desc_tokens) <= 4)
+        if low_evidence and curr_score > 0 and c_state != "HARD-FAIL":
+            like = max(like, 12)
+            if curr_score > 0 and abs(curr_score - best_score) < 1e-9:
+                like = max(like, 16)
 
         row_scores.append(
             RowScore(
