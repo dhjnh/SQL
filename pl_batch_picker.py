@@ -506,6 +506,9 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
             near_cache[key] = _concept_link_score(desc_concepts, sub_concepts, kb)
         return near_cache[key]
 
+    generic_words = {"bolt", "nut", "washer", "screw", "clip", "pin", "grommet", "retainer", "plug", "gasket", "seal", "clamp", "spring", "stud", "rivet", "oring", "o_ring", "fastener"}
+    strong_tokens = set((kb.get("strong_token_weight", {}) or {}).keys())
+
     for i, row in enumerate(rows):
         desc_all = f"{_to_text(row.get('PNCDesc'))} {_to_text(row.get('PartDescription'))}".strip().lower()
         gpg = _to_text(row.get("SubCategory_GPG")).lower()
@@ -528,9 +531,39 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         old_domain = _infer_old_domain(gpg_tokens, category=category, kb=kb)
         c_state, guard_penalty = _category_state_from_guard(category, old_domain, kb)
 
-        w_overlap = _weighted_overlap_cached(desc_tokens, sub_tokens)
-        c_overlap = len(desc_concepts & sub_concepts)
-        near = _near_cached(desc_concepts, sub_concepts)
+        pnc_text = _to_text(row.get("PNCDesc")).lower()
+        part_desc_text = _to_text(row.get("PartDescription")).lower()
+        is_standard_parts = _norm_text(pnc_text) == "standard_parts"
+        for_match = re.search(r"\(\s*for\s+([^)]+)\)|\bfor\s+([a-z0-9\-\s]{2,80})", pnc_text)
+        for_subject = ""
+        if for_match:
+            for_subject = (for_match.group(1) or for_match.group(2) or "").strip()
+        subject_text = f"{for_subject} {part_desc_text}".strip()
+        subject_tokens = _tok_cached(subject_text)
+        subject_concepts = _concept_cached(subject_tokens)
+
+        generic_fastener = "generic_fastener" in desc_concepts or any(t in generic_words for t in desc_tokens)
+        has_subject_object = bool(for_subject) or any(t in strong_tokens for t in desc_tokens)
+        is_generic = generic_fastener or is_standard_parts
+        generic_no_subject = is_standard_parts or (is_generic and not has_subject_object)
+        generic_with_subject = is_generic and has_subject_object
+
+        desc_tokens_match = [t for t in desc_tokens if (not is_generic) or (t not in generic_words)]
+        sub_tokens_match = [t for t in sub_tokens if t not in generic_words]
+        if not desc_tokens_match:
+            desc_tokens_match = desc_tokens
+        if not sub_tokens_match:
+            sub_tokens_match = sub_tokens
+        desc_concepts_match = _concept_cached(desc_tokens_match)
+        sub_concepts_match = _concept_cached(sub_tokens_match)
+
+        w_overlap = _weighted_overlap_cached(desc_tokens_match, sub_tokens_match)
+        c_overlap = len(desc_concepts_match & sub_concepts_match)
+        near = _near_cached(desc_concepts_match, sub_concepts_match)
+
+        subject_near = _near_cached(subject_concepts, sub_concepts_match) if subject_concepts else 0.0
+        subject_related = bool(subject_concepts & sub_concepts_match) or subject_near >= 1.0 or any((t in strong_tokens and t in set(sub_tokens_match)) for t in subject_tokens)
+        generic_subject_conflict = generic_with_subject and (not subject_related)
 
         if c_state == "HARD-FAIL":
             d_state = "OUT"
@@ -541,7 +574,6 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         else:
             d_state = "OUT"
 
-        generic_fastener = "generic_fastener" in desc_concepts or any(t in desc_tokens for t in ["bolt", "nut", "screw", "washer", "fastener", "clip", "clamp", "rivet", "retainer", "pin"])
         sub_fastener = any(t in {"fastener", "bolt", "nut", "screw", "washer"} for t in sub_tokens)
 
         score_desc = 35
@@ -596,7 +628,24 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
                         best_penalty = max(best_penalty, int(round(pl_max_penalty * s)))
             pl_delta = best_bonus if best_bonus > 0 else -best_penalty
 
-        score_term = term_base + gpg_delta + pl_delta
+        context_adjust = 0
+        if generic_no_subject:
+            pl_map = kb.get("pl_light_map", {})
+            cat_n = _norm_text(category)
+            sub_n = _norm_text(subcategory)
+            gpg_last = ""
+            if gpg:
+                gpg_last_raw = re.split(r"[\/]+", gpg)[-1].strip()
+                gpg_last = _norm_text(gpg_last_raw.replace("-", " ").replace(" ", "_"))
+            cand = list(pl_map.get(gpg_last, [])) if gpg_last else []
+            if cand:
+                if any(m_cat == cat_n and m_sub == sub_n for m_cat, m_sub, _ in cand):
+                    context_adjust = 6
+                elif any(m_cat == cat_n for m_cat, _m_sub, _ in cand):
+                    context_adjust = 3
+                else:
+                    context_adjust = -4
+        score_term = term_base + gpg_delta + pl_delta + context_adjust
         if c_state == "UNCERTAIN" and guard_penalty < 0:
             score_term = int(round(score_term * max(0.0, 1.0 + guard_penalty * 0.8)))
         score_term = max(0, min(100, score_term))
@@ -629,10 +678,9 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
             conf *= 0.80
         conf = max(0.0, min(1.0, conf))
 
-        generic_no_object = generic_fastener and not has_object
         hard_mismatch = (
             d_state == "OUT"
-            and (not generic_fastener)
+            and (not is_generic)
             and w_overlap < 0.3
             and c_overlap == 0
             and near < 0.8
@@ -645,12 +693,17 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         like = round(like_raw * factor)
         like = max(1, min(100, like))
         if c_state == "HARD-FAIL":
-            like = min(like, 15)
+            like = min(like, 3)
+        if generic_subject_conflict:
+            like = min(like, 4)
         if hard_mismatch:
-            like = min(like, 8)
-        if generic_no_object and d_state == "OUT" and (not hard_mismatch):
-            like = max(like, 12)
-            like = min(like, 35)
+            like = min(like, 4)
+        if generic_no_subject and d_state == "OUT" and (not hard_mismatch):
+            if context_adjust >= 3:
+                like = max(like, 10)
+                like = min(like, 16)
+            elif context_adjust < 0:
+                like = min(like, 6)
 
         row_scores.append(
             RowScore(
