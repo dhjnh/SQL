@@ -1174,6 +1174,9 @@ class App:
             empty_pl_count = 0
 
             self._start_runtime_clock(total)
+            checkpoint_every = 50
+            checkpoint_secs = 15.0
+            last_checkpoint = time.perf_counter()
             for i, q in enumerate(queue_rows, start=1):
                 if not self._wait_if_paused_or_stop():
                     self.log("Stopped by user")
@@ -1212,6 +1215,14 @@ class App:
                         empty_pl_count += 1
 
                     with conn.cursor() as cur:
+                        sql = (
+                            f"UPDATE [{schema}].[{mod_table}] SET [{colmap['like']}]=%s, [{colmap['ispick']}]=%s "
+                            f"WHERE [{colmap['VehicleId_Motor']}]=%s AND [{colmap['Category']}]=%s AND [{colmap['SubCategory']}]=%s "
+                            f"AND (([{colmap['PNCDesc']}]=%s) OR ([{colmap['PNCDesc']}] IS NULL AND %s IS NULL)) "
+                            f"AND (([{colmap['PartNumber']}]=%s) OR ([{colmap['PartNumber']}] IS NULL AND %s IS NULL)) "
+                            f"AND (([{colmap['SubCategory_GPG']}]=%s) OR ([{colmap['SubCategory_GPG']}] IS NULL AND %s IS NULL)) "
+                            f"AND (([{colmap['SearchPartNumber']}]=%s) OR ([{colmap['SearchPartNumber']}] IS NULL AND %s IS NULL))"
+                        )
                         for rs in scored:
                             if self.stop_requested:
                                 conn.rollback()
@@ -1235,14 +1246,6 @@ class App:
                                 rs.row.get("SubCategory_GPG"),
                                 rs.row.get("SearchPartNumber"),
                                 rs.row.get("SearchPartNumber"),
-                            )
-                            sql = (
-                                f"UPDATE [{schema}].[{mod_table}] SET [{colmap['like']}]=%s, [{colmap['ispick']}]=%s "
-                                f"WHERE [{colmap['VehicleId_Motor']}]=%s AND [{colmap['Category']}]=%s AND [{colmap['SubCategory']}]=%s "
-                                f"AND (([{colmap['PNCDesc']}]=%s) OR ([{colmap['PNCDesc']}] IS NULL AND %s IS NULL)) "
-                                f"AND (([{colmap['PartNumber']}]=%s) OR ([{colmap['PartNumber']}] IS NULL AND %s IS NULL)) "
-                                f"AND (([{colmap['SubCategory_GPG']}]=%s) OR ([{colmap['SubCategory_GPG']}] IS NULL AND %s IS NULL)) "
-                                f"AND (([{colmap['SearchPartNumber']}]=%s) OR ([{colmap['SearchPartNumber']}] IS NULL AND %s IS NULL))"
                             )
                             cur.execute(sql, params)
                             if cur.rowcount == 0:
@@ -1269,7 +1272,10 @@ class App:
                     conn.rollback()
                     self._update_runtime_clock(i)
                 self.set_progress_value(i, total)
-                self._save_queue(queue_file, queue_rows)
+                now = time.perf_counter()
+                if (i % checkpoint_every == 0) or (now - last_checkpoint >= checkpoint_secs) or (q.get("status") == "FAIL"):
+                    self._save_queue(queue_file, queue_rows)
+                    last_checkpoint = now
 
             self._update_runtime_clock(total)
             self._stop_runtime_clock()
