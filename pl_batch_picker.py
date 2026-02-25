@@ -794,12 +794,17 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
             like = min(like, 4)
         if hard_mismatch:
             like = min(like, 4)
-        if generic_no_subject and d_state == "OUT" and (not hard_mismatch):
+        # 通用无主语件：仅在“PL不匹配”时做保底；PL匹配给更高一档，区间不重叠，便于稳定区分
+        if generic_no_subject and d_state == "OUT" and c_state != "HARD-FAIL" and (not hard_mismatch):
             if context_adjust >= 3:
-                like = max(like, 10)
+                # PL匹配：抬到更高档（12~16），显著高于不匹配通用件
+                like = max(like, 12)
                 like = min(like, 16)
             elif context_adjust < 0:
-                like = min(like, 6)
+                # PL不匹配：仅保底到较低档（7~11），避免与PL匹配档位重叠
+                like = max(like, 7)
+                like = min(like, 11)
+            # context_adjust==0：不做保底，保持原分数
 
         has_strong_hit = any(t in strong_tokens for t in desc_tokens)
         low_evidence = ((score_desc + score_term) < 85) or ((not has_strong_hit) and len(desc_tokens) <= 4)
@@ -807,6 +812,14 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
             like = max(like, 12)
             if curr_score > 0 and abs(curr_score - best_score) < 1e-9:
                 like = max(like, 16)
+
+        # 最终封顶优先级：确保 HARD-FAIL / hard_mismatch 规则不被前面保底或抬分覆盖
+        if c_state == "HARD-FAIL":
+            like = min(like, 3)
+        if generic_subject_conflict:
+            like = min(like, 4)
+        if hard_mismatch:
+            like = min(like, 4)
 
         row_scores.append(
             RowScore(
