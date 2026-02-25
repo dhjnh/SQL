@@ -678,7 +678,7 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         overlap_ratio = w_overlap / max(1e-9, sub_total_weight)
 
         subject_near = _near_cached(subject_concepts, sub_concepts_match) if subject_concepts else 0.0
-        subject_related = bool(subject_concepts & sub_concepts_match) or subject_near >= 1.0 or any((t in strong_tokens and t in set(sub_tokens_match)) for t in subject_tokens)
+        subject_related = bool(set(subject_tokens) & set(sub_tokens_match)) or bool(subject_concepts & sub_concepts_match) or subject_near >= 1.0 or any((t in strong_tokens and t in set(sub_tokens_match)) for t in subject_tokens)
         generic_subject_conflict = generic_with_subject and (not subject_related)
 
         hit_ratio = float((kb.get("scoring_defaults") or {}).get("overlap_hit_ratio", 0.35))
@@ -825,7 +825,7 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         like = max(1, min(100, like))
         if c_state == "HARD-FAIL":
             like = min(like, 3)
-        if generic_subject_conflict:
+        if generic_subject_conflict and d_state != "HIT" and pl_delta <= 0 and gpg_delta <= 0:
             like = min(like, 4)
         if hard_mismatch:
             like = min(like, 4)
