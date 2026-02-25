@@ -36,6 +36,12 @@ QUEUE_FIELDS = [
     "notes",
 ]
 
+NOISE_TOKENS = {
+    "and", "or", "of", "for", "with", "without", "used", "use", "to", "in", "on", "at", "by", "from",
+    "the", "a", "an", "as", "is", "are", "was", "were", "be", "been", "being",
+    "w", "w_", "w__", "w___",
+}
+
 
 @dataclass
 class RowScore:
@@ -503,7 +509,7 @@ def _concept_link_score(a_concepts: Set[str], b_concepts: Set[str], kb: Dict[str
 
 
 def _weighted_overlap(desc_tokens: Sequence[str], sub_tokens: Sequence[str], kb: Dict[str, Any]) -> float:
-    overlap = set(desc_tokens) & set(sub_tokens)
+    overlap = (set(desc_tokens) & set(sub_tokens)) - NOISE_TOKENS
     if not overlap:
         return 0.0
     wmap = kb.get("weight_map", {})
@@ -591,8 +597,11 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
 
     generic_words = {"bolt", "nut", "washer", "screw", "clip", "pin", "grommet", "retainer", "plug", "gasket", "seal", "clamp", "spring", "stud", "rivet", "oring", "o_ring", "fastener"}
     strong_tokens = set((kb.get("strong_token_weight", {}) or {}).keys())
+    noise = NOISE_TOKENS
 
     def _token_weight(tok: str) -> float:
+        if (not tok) or (tok in noise):
+            return 0.0
         w = _safe_float((kb.get("weight_map", {}) or {}).get(tok, 1.0), 1.0)
         weak = kb.get("weak_token_weight", {}) or {}
         strong = kb.get("strong_token_weight", {}) or {}
@@ -617,7 +626,8 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         sub_concepts = _concept_cached(sub_tokens)
 
         obj = _extract_object_phrase(desc_all)
-        obj_tokens = _tok_cached(obj)
+        obj_tokens_raw = _tok_cached(obj)
+        obj_tokens = [t for t in obj_tokens_raw if t and t not in noise]
         obj_concepts = _concept_cached(obj_tokens)
         has_object = bool(obj_tokens)
 
@@ -641,7 +651,8 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         if for_match:
             for_subject = (for_match.group(1) or for_match.group(2) or "").strip()
         subject_text = f"{for_subject} {part_desc_text}".strip()
-        subject_tokens = _tok_cached(subject_text)
+        subject_tokens_raw = _tok_cached(subject_text)
+        subject_tokens = [t for t in subject_tokens_raw if t and t not in noise]
         subject_concepts = _concept_cached(subject_tokens)
 
         desc_tok_norm = {t.replace("-", "_") for t in desc_tokens}
@@ -651,12 +662,13 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         generic_no_subject = is_standard_parts or (is_generic and not has_subject_object)
         generic_with_subject = is_generic and has_subject_object
 
-        desc_tokens_match = [t for t in desc_tokens if (not is_generic) or (t not in generic_words)]
-        sub_tokens_match = [t for t in sub_tokens if t not in generic_words]
+        desc_tokens_match = [t for t in desc_tokens if t and (t not in noise) and (((not is_generic) or (t not in generic_words)))]
+        sub_tokens_match = [t for t in sub_tokens if t and (t not in noise) and (t not in generic_words)]
         if not desc_tokens_match:
-            desc_tokens_match = desc_tokens
+            # 兜底也要优先排除 noise，避免只剩 and
+            desc_tokens_match = [t for t in desc_tokens if t and t not in noise] or desc_tokens
         if not sub_tokens_match:
-            sub_tokens_match = sub_tokens
+            sub_tokens_match = [t for t in sub_tokens if t and t not in noise] or sub_tokens
         desc_concepts_match = _concept_cached(desc_tokens_match)
         sub_concepts_match = _concept_cached(sub_tokens_match)
 
@@ -672,11 +684,12 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
 
         hit_ratio = float((kb.get("scoring_defaults") or {}).get("overlap_hit_ratio", 0.35))
         near_ratio = float((kb.get("scoring_defaults") or {}).get("overlap_near_ratio", 0.20))
+        has_meaningful_overlap = (w_overlap > 0.0) or (c_overlap > 0)
         if c_state == "HARD-FAIL":
             d_state = "OUT"
         elif (overlap_ratio >= hit_ratio) or (c_overlap >= 1):
             d_state = "HIT"
-        elif (overlap_ratio >= near_ratio) or (near >= 1.0):
+        elif (overlap_ratio >= near_ratio) or (has_meaningful_overlap and near >= 1.0):
             d_state = "NEAR"
         else:
             d_state = "OUT"
