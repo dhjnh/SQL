@@ -1423,6 +1423,8 @@ class App:
         table = self.table.get().strip()
         mod_table = f"{table}_Mod"
         queue_file = self._queue_file_path(schema, table)
+        prep_started_at = time.perf_counter()
+        build_to_pl_started_at = None
 
         def _generate_queue(conn, cmap):
             self.set_stage("generating PL queue")
@@ -1485,6 +1487,7 @@ class App:
                 resume_mode = False
 
             if not resume_mode:
+                build_to_pl_started_at = time.perf_counter()
                 try:
                     os.remove(self._queue_log_path(queue_file))
                     self.log("Removed old queue log for fresh run")
@@ -1546,6 +1549,14 @@ class App:
             except Exception as e:
                 self.log(f"WARN: full-table unique SPN count failed: {e}")
 
+            prep_elapsed_sec = max(0.0, time.perf_counter() - prep_started_at)
+            prep_elapsed_txt = f"{int(prep_elapsed_sec // 3600):02d}:{int((prep_elapsed_sec % 3600) // 60):02d}:{int(prep_elapsed_sec % 60):02d}"
+            if build_to_pl_started_at is not None:
+                build_to_pl_sec = max(0.0, time.perf_counter() - build_to_pl_started_at)
+                build_to_pl_txt = f"{int(build_to_pl_sec // 3600):02d}:{int((build_to_pl_sec % 3600) // 60):02d}:{int(build_to_pl_sec % 60):02d}"
+            else:
+                build_to_pl_txt = "--:--:--"
+            self.log(f"准备阶段耗时={prep_elapsed_txt}, 建表到PL打分开始耗时={build_to_pl_txt}")
             self.set_stage("processing PL loop")
             self.log("processing PL loop")
             with queue_file.open("r", encoding="utf-8", newline="") as f:
@@ -1756,6 +1767,7 @@ class App:
                 f"选中去重SPN后数量={selected_unique_spn}\n"
                 f"当前完整表格内去重SPN数量={full_table_unique_spn}\n"
                 f"总处理用时={elapsed_used_txt}\n"
+                f"建表到PL打分开始耗时={build_to_pl_txt}\n"
                 f"PL内SPN重复剔除行数={duplicates_removed}, 涉及PL数={dup_pl_count}\n"
                 f"like分布: <=15={like_counter['<=15']} 16-20={like_counter['16-20']} 21-35={like_counter['21-35']} "
                 f"36-60={like_counter['36-60']} 61-80={like_counter['61-80']} 81-100={like_counter['81-100']}"
