@@ -825,8 +825,6 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         like = max(1, min(100, like))
         if c_state == "HARD-FAIL":
             like = min(like, 3)
-        if generic_subject_conflict and d_state != "HIT" and pl_delta <= 0 and gpg_delta <= 0:
-            like = min(like, 4)
         if hard_mismatch:
             like = min(like, 4)
         # 通用无主语件：仅在“PL不匹配”时做保底；PL匹配给更高一档，区间不重叠，便于稳定区分
@@ -853,7 +851,7 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
         # 最终封顶优先级：确保 HARD-FAIL / hard_mismatch 规则不被前面保底或抬分覆盖
         if c_state == "HARD-FAIL":
             like = min(like, 3)
-        if generic_subject_conflict:
+        if generic_subject_conflict and d_state != "HIT" and pl_delta <= 0 and gpg_delta <= 0:
             like = min(like, 4)
         if hard_mismatch:
             like = min(like, 4)
