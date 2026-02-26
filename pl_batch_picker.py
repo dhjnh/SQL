@@ -1022,6 +1022,16 @@ class App:
         self.clock_start = 0.0
         self.clock_done = 0
         self.clock_total = 0
+        self.clock_lock = threading.Lock()
+        self.clock_paused = False
+        self.clock_pause_started = 0.0
+        self.clock_paused_total = 0.0
+        self.clock_total_work = 0
+        self.clock_done_work = 0
+        self.clock_base_done = 0
+        self.clock_base_done_work = 0
+        self.clock_ema_sec_per_work = None
+        self.clock_ema_alpha = 0.22
 
         frm = ttk.Frame(root, padding=8)
         frm.grid(sticky="nsew")
@@ -1130,36 +1140,102 @@ class App:
             self.progress.configure(mode="determinate", maximum=max(1, total), value=max(0, min(current, total)))
         self.ui(_u)
 
-    def _start_runtime_clock(self, total: int):
-        self.clock_running = True
-        self.clock_start = time.perf_counter()
-        self.clock_done = 0
-        self.clock_total = max(0, int(total))
+    def _start_runtime_clock(self, total_pl: int, total_work: int, done_pl_initial: int = 0, done_work_initial: int = 0):
+        with self.clock_lock:
+            self.clock_running = True
+            self.clock_start = time.perf_counter()
+            self.clock_done = max(0, int(done_pl_initial))
+            self.clock_total = max(0, int(total_pl))
+            self.clock_total_work = max(0, int(total_work))
+            self.clock_done_work = max(0, int(done_work_initial))
+            self.clock_base_done = self.clock_done
+            self.clock_base_done_work = self.clock_done_work
+            self.clock_paused = False
+            self.clock_pause_started = 0.0
+            self.clock_paused_total = 0.0
+            self.clock_ema_sec_per_work = None
         self.ui(lambda: self.runtime_var.set("Elapsed: 00:00:00 | ETA: --:--:--"))
         self.ui(lambda: self.root.after(1000, self._tick_runtime_clock))
 
-    def _update_runtime_clock(self, done: int):
-        self.clock_done = max(0, int(done))
+    def _pause_runtime_clock(self):
+        with self.clock_lock:
+            if not self.clock_running or self.clock_paused:
+                return
+            self.clock_paused = True
+            self.clock_pause_started = time.perf_counter()
+
+    def _resume_runtime_clock(self):
+        with self.clock_lock:
+            if not self.clock_running or (not self.clock_paused):
+                return
+            now = time.perf_counter()
+            self.clock_paused_total += max(0.0, now - self.clock_pause_started)
+            self.clock_paused = False
+            self.clock_pause_started = 0.0
+
+    def _eta_sample(self, sec: float, work: int, done_pl_add: int = 1):
+        w = int(work) if work is not None else 0
+        if w <= 0 or sec <= 0:
+            with self.clock_lock:
+                self.clock_done += max(0, int(done_pl_add))
+            return
+        spu = float(sec) / float(w)
+        with self.clock_lock:
+            self.clock_done += max(0, int(done_pl_add))
+            self.clock_done_work += w
+            if self.clock_ema_sec_per_work is None:
+                self.clock_ema_sec_per_work = spu
+            else:
+                a = float(self.clock_ema_alpha)
+                self.clock_ema_sec_per_work = (1.0 - a) * float(self.clock_ema_sec_per_work) + a * spu
 
     def _stop_runtime_clock(self):
-        self.clock_running = False
-        self.clock_done = 0
-        self.clock_total = 0
+        with self.clock_lock:
+            self.clock_running = False
+            self.clock_done = 0
+            self.clock_total = 0
+            self.clock_total_work = 0
+            self.clock_done_work = 0
+            self.clock_base_done = 0
+            self.clock_base_done_work = 0
+            self.clock_paused = False
+            self.clock_pause_started = 0.0
+            self.clock_paused_total = 0.0
+            self.clock_ema_sec_per_work = None
         self.ui(lambda: self.runtime_var.set("Elapsed: 00:00:00 | ETA: --:--:--"))
 
     def _tick_runtime_clock(self):
-        if not self.clock_running:
-            return
-        elapsed = max(0.0, time.perf_counter() - self.clock_start)
-        done = max(0, self.clock_done)
-        total = max(0, self.clock_total)
+        with self.clock_lock:
+            if not self.clock_running:
+                return
+            now = time.perf_counter()
+            paused_extra = (now - self.clock_pause_started) if self.clock_paused else 0.0
+            elapsed = max(0.0, now - self.clock_start - self.clock_paused_total - max(0.0, paused_extra))
+            done_pl = max(0, int(self.clock_done))
+            total_pl = max(0, int(self.clock_total))
+            done_work = max(0, int(self.clock_done_work))
+            total_work = max(0, int(self.clock_total_work))
+            base_done = max(0, int(self.clock_base_done))
+            ema_spu = self.clock_ema_sec_per_work
+
         eta_txt = "--:--:--"
-        if done > 0 and total >= done:
-            avg = elapsed / done
-            eta_sec = max(0, int(round(avg * (total - done))))
-            h2, rem2 = divmod(eta_sec, 3600)
+        rem_work = max(0, total_work - done_work)
+        rem_pl = max(0, total_pl - done_pl)
+
+        if (ema_spu is not None) and rem_work > 0:
+            eta_sec = int(round(float(ema_spu) * float(rem_work)))
+            h2, rem2 = divmod(max(0, eta_sec), 3600)
             m2, s2 = divmod(rem2, 60)
             eta_txt = f"{h2:02d}:{m2:02d}:{s2:02d}"
+        else:
+            done_delta = max(0, done_pl - base_done)
+            if done_delta > 0 and rem_pl > 0:
+                avg = elapsed / done_delta
+                eta_sec = int(round(avg * rem_pl))
+                h2, rem2 = divmod(max(0, eta_sec), 3600)
+                m2, s2 = divmod(rem2, 60)
+                eta_txt = f"{h2:02d}:{m2:02d}:{s2:02d}"
+
         h1, rem1 = divmod(int(elapsed), 3600)
         m1, s1 = divmod(rem1, 60)
         self.runtime_var.set(f"Elapsed: {h1:02d}:{m1:02d}:{s1:02d} | ETA: {eta_txt}")
@@ -1255,11 +1331,13 @@ class App:
 
     def pause_run(self):
         if self.running:
+            self._pause_runtime_clock()
             self.resume_event.clear()
             self.log("Paused")
 
     def resume_run(self):
         if self.running:
+            self._resume_runtime_clock()
             self.resume_event.set()
             self.log("Resumed")
 
@@ -1635,7 +1713,10 @@ class App:
 
             idx_plhash = (f"IX_{mod_table}_PLHash")[:128]
             use_pl_hash = self._has_column(conn, schema, mod_table, "__pl_hash") and self._has_index_on_column(conn, schema, mod_table, "__pl_hash", idx_plhash)
-            self._start_runtime_clock(total)
+            total_work = sum(int(r.get("row_cnt") or 0) for r in queue_rows)
+            done_pl_initial = sum(1 for r in queue_rows if (r.get("status") or "").upper() == "DONE")
+            done_work_initial = sum(int(r.get("row_cnt") or 0) for r in queue_rows if (r.get("status") or "").upper() == "DONE")
+            self._start_runtime_clock(total_pl=total, total_work=total_work, done_pl_initial=done_pl_initial, done_work_initial=done_work_initial)
             log_f, log_w = self._open_queue_log_writer(log_path)
             log_flush_every = 200
             log_i = 0
@@ -1650,11 +1731,14 @@ class App:
                     stop_pl = False
                     if q.get("status") == "DONE":
                         processed += 1
-                        self._update_runtime_clock(i)
                         continue
-                    self._update_runtime_clock(i - 1)
                     self.ui(lambda i=i, total=total, key=key, rc=q['row_cnt']: self.pl_var.set(f"PL: {i}/{total} {key} rows={rc}"))
                     try:
+                        pl_t0 = time.perf_counter()
+                        try:
+                            rc = int(q.get("row_cnt") or 0)
+                        except Exception:
+                            rc = 0
                         self.set_stage("PL fetch rows")
                         with conn.cursor(as_dict=True) as cur:
                             if use_pl_hash:
@@ -1769,7 +1853,8 @@ class App:
                         if (log_i % log_flush_every) == 0:
                             log_f.flush()
                         processed += 1
-                        self._update_runtime_clock(i)
+                        pl_sec = max(0.0, time.perf_counter() - pl_t0)
+                        self._eta_sample(sec=pl_sec, work=rc, done_pl_add=1)
                     except Exception as e:
                         # 仅用于定位卡点，不改变业务逻辑：异常回滚
                         self.set_stage("PL error: rollback")
@@ -1782,7 +1867,6 @@ class App:
                             log_f.flush()
                         except Exception:
                             pass
-                        self._update_runtime_clock(i)
                     self.set_progress_value(i, total)
                     # 仅用于定位卡点，不改变业务逻辑：每轮收尾恢复循环阶段
                     self.set_stage("processing PL loop")
@@ -1811,7 +1895,6 @@ class App:
                     except Exception as _e2:
                         self.log(f"WARN: remove queue log failed: {_e2}")
 
-            self._update_runtime_clock(total)
             elapsed_total = max(0.0, time.perf_counter() - getattr(self, "clock_start", time.perf_counter()))
             elapsed_total_sec = int(round(elapsed_total))
             h_used, rem_used = divmod(elapsed_total_sec, 3600)
