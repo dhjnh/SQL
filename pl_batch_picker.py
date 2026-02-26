@@ -1376,10 +1376,7 @@ class App:
             self.resume_event.set()
             self.running = False
             self.worker_thread = None
-        self.clock_running = False
-        self.clock_start = 0.0
-        self.clock_done = 0
-        self.clock_total = 0
+            self._stop_runtime_clock()
 
     def _validate_required_columns(self, conn, schema: str, table_name: str) -> Dict[str, str]:
         required = [
@@ -1703,7 +1700,8 @@ class App:
             if log_path.exists() and os.access(log_path, os.R_OK):
                 self._apply_queue_log(queue_rows, log_path)
             total = len(queue_rows)
-            processed = 0
+            processed_total = 0
+            processed_new = 0
             duplicates_removed = 0
             dup_pl_count = 0
             like_counter = Counter()
@@ -1729,8 +1727,10 @@ class App:
                         self.log("Stopped by user")
                         break
                     stop_pl = False
-                    if q.get("status") == "DONE":
-                        processed += 1
+                    if (q.get("status") or "").upper() == "DONE":
+                        processed_total += 1
+                        self.set_progress_value(i, total)
+                        self.set_stage("processing PL loop")
                         continue
                     self.ui(lambda i=i, total=total, key=key, rc=q['row_cnt']: self.pl_var.set(f"PL: {i}/{total} {key} rows={rc}"))
                     try:
@@ -1852,7 +1852,8 @@ class App:
                         log_i += 1
                         if (log_i % log_flush_every) == 0:
                             log_f.flush()
-                        processed += 1
+                        processed_total += 1
+                        processed_new += 1
                         pl_sec = max(0.0, time.perf_counter() - pl_t0)
                         self._eta_sample(sec=pl_sec, work=rc, done_pl_add=1)
                     except Exception as e:
@@ -1895,17 +1896,20 @@ class App:
                     except Exception as _e2:
                         self.log(f"WARN: remove queue log failed: {_e2}")
 
-            elapsed_total = max(0.0, time.perf_counter() - getattr(self, "clock_start", time.perf_counter()))
+            with self.clock_lock:
+                now = time.perf_counter()
+                paused_extra = (now - self.clock_pause_started) if self.clock_paused else 0.0
+                elapsed_total = max(0.0, now - self.clock_start - self.clock_paused_total - max(0.0, paused_extra))
             elapsed_total_sec = int(round(elapsed_total))
             h_used, rem_used = divmod(elapsed_total_sec, 3600)
             m_used, s_used = divmod(rem_used, 60)
             elapsed_used_txt = f"{h_used:02d}:{m_used:02d}:{s_used:02d}"
             self._stop_runtime_clock()
             self.set_progress_indeterminate(False)
-            avg_pick = round(selected_count / total, 2) if total else 0
+            avg_pick = round(selected_count / max(1, processed_new), 2)
             selected_unique_spn = len(global_picked)
             summary = (
-                f"总PL={total}, DONE={processed}, ispick=1总行数={selected_count}, 未选中PL数={empty_pl_count}, "
+                f"总PL={total}, DONE={processed_total}, 本次新处理PL数={processed_new}, ispick=1总行数={selected_count}, 未选中PL数={empty_pl_count}, "
                 f"选满10个PL数={full_10_count}, 平均每PL选中数={avg_pick}\n"
                 f"选中去重SPN后数量={selected_unique_spn}\n"
                 f"当前完整表格内去重SPN数量={full_table_unique_spn}\n"
