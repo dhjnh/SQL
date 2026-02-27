@@ -128,6 +128,29 @@ def compute_pl_hash(vehicle: Any, category: Any, subcategory: Any) -> bytes:
     return hashlib.sha256(_h(vehicle) + _h(category) + _h(subcategory)).digest()
 
 
+def _update_like_ispick_values(
+    cur,
+    schema: str,
+    table: str,
+    col_like: str,
+    col_ispick: str,
+    params_list: Sequence[Tuple[Any, Any, Any]],
+    chunk_rows: int = 600,
+):
+    if not params_list:
+        return
+    head = f"UPDATE t SET t.[{col_like}]=v.[like], t.[{col_ispick}]=v.[ispick] FROM [{schema}].[{table}] t JOIN (VALUES "
+    tail = ") v([like],[ispick],[__rowid]) ON t.[__rowid]=v.[__rowid]"
+    n = len(params_list)
+    for off in range(0, n, chunk_rows):
+        chunk = params_list[off:off + chunk_rows]
+        values_sql = ",".join(["(%s,%s,%s)"] * len(chunk))
+        flat_params: List[Any] = []
+        for a, b, c in chunk:
+            flat_params.extend((a, b, c))
+        cur.execute(head + values_sql + tail, tuple(flat_params))
+
+
 def _read_csv_dicts(path: Path) -> List[Dict[str, str]]:
     if not path.exists():
         return []
@@ -580,7 +603,7 @@ def _extract_object_phrase(text: str) -> str:
     return ""
 
 
-def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[RowScore], int]:
+def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any], category: Any, subcategory: Any) -> Tuple[List[RowScore], int]:
     value_scores = safe_percentiles([_safe_float(r.get("value1"), 0.0) for r in rows])
     row_scores: List[RowScore] = []
 
@@ -652,19 +675,25 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
             w *= _safe_float(strong.get(tok, 2.0), 2.0)
         return max(0.0, w)
 
+    category_txt = _to_text(category)
+    subcategory_txt = _to_text(subcategory)
+    sub_tokens_fixed = _tok_cached(subcategory_txt.lower())
+    sub_concepts_fixed = _concept_cached(sub_tokens_fixed)
+    cat_n_fixed = _norm_label(category_txt)
+    sub_n_fixed = _norm_label(subcategory_txt)
+
     for i, row in enumerate(rows):
         desc_all = f"{_to_text(row.get('PNCDesc'))} {_to_text(row.get('PartDescription'))}".strip().lower()
         gpg = _to_text(row.get("SubCategory_GPG")).lower()
-        subcategory = _to_text(row.get("SubCategory"))
-        category_raw = _to_text(row.get("Category"))
-        category = category_raw
+        category = category_txt
+        subcategory = subcategory_txt
 
         desc_tokens = _tok_cached(desc_all)
         desc_concepts = _concept_cached(desc_tokens)
         gpg_tokens = _gpg_tok_cached(gpg)
         gpg_concepts = _concept_cached(gpg_tokens)
-        sub_tokens = _tok_cached(subcategory.lower())
-        sub_concepts = _concept_cached(sub_tokens)
+        sub_tokens = sub_tokens_fixed
+        sub_concepts = sub_concepts_fixed
 
         obj = _extract_object_phrase(desc_all)
         obj_tokens_raw = _tok_cached(obj)
@@ -774,8 +803,8 @@ def score_pl_rows(rows: List[Dict[str, Any]], kb: Dict[str, Any]) -> Tuple[List[
             pl_max_penalty = int(kb["scoring_defaults"].get("pl_light_max_penalty", 3))
             pl_neg_cap = int(kb["scoring_defaults"].get("pl_light_neg_cap", -2))
             pl_map = kb.get("pl_light_map", {})
-            cat_n = _norm_label(category)
-            sub_n = _norm_label(subcategory)
+            cat_n = cat_n_fixed
+            sub_n = sub_n_fixed
 
             def _norm_pl_score(m_score: Any) -> float:
                 scale_max = float(kb.get("pl_light_scale_max", 1.0) or 1.0)
@@ -1725,16 +1754,14 @@ class App:
                             if use_pl_hash:
                                 pl_hash = compute_pl_hash(key[0], key[1], key[2])
                                 cur.execute(
-                                    f"SELECT [__rowid] AS __rowid, [{colmap['VehicleId_Motor']}] AS VehicleId_Motor, [{colmap['Category']}] AS Category, [{colmap['SubCategory']}] AS SubCategory, "
-                                    f"[{colmap['PNCDesc']}] AS PNCDesc, [{colmap['PartNumber']}] AS PartNumber, [{colmap['SubCategory_GPG']}] AS SubCategory_GPG, "
+                                    f"SELECT [__rowid] AS __rowid, [{colmap['PNCDesc']}] AS PNCDesc, [{colmap['PartNumber']}] AS PartNumber, [{colmap['SubCategory_GPG']}] AS SubCategory_GPG, "
                                     f"[{colmap['SearchPartNumber']}] AS SearchPartNumber, [{colmap['PartDescription']}] AS PartDescription, [{colmap['value1']}] AS value1 "
                                     f"FROM [{schema}].[{mod_table}] WHERE [__pl_hash]=%s AND [{colmap['VehicleId_Motor']}]=%s AND [{colmap['Category']}]=%s AND [{colmap['SubCategory']}]=%s",
                                     (pl_hash, key[0], key[1], key[2]),
                                 )
                             else:
                                 cur.execute(
-                                    f"SELECT [__rowid] AS __rowid, [{colmap['VehicleId_Motor']}] AS VehicleId_Motor, [{colmap['Category']}] AS Category, [{colmap['SubCategory']}] AS SubCategory, "
-                                    f"[{colmap['PNCDesc']}] AS PNCDesc, [{colmap['PartNumber']}] AS PartNumber, [{colmap['SubCategory_GPG']}] AS SubCategory_GPG, "
+                                    f"SELECT [__rowid] AS __rowid, [{colmap['PNCDesc']}] AS PNCDesc, [{colmap['PartNumber']}] AS PartNumber, [{colmap['SubCategory_GPG']}] AS SubCategory_GPG, "
                                     f"[{colmap['SearchPartNumber']}] AS SearchPartNumber, [{colmap['PartDescription']}] AS PartDescription, [{colmap['value1']}] AS value1 "
                                     f"FROM [{schema}].[{mod_table}] WHERE [{colmap['VehicleId_Motor']}]=%s AND [{colmap['Category']}]=%s AND [{colmap['SubCategory']}]=%s",
                                     key,
@@ -1749,8 +1776,7 @@ class App:
                                 self.log("WARN: PLHash returned 0 rows but queue row_cnt>0, fallback to non-hash fetch")
                                 with conn.cursor(as_dict=True) as cur:
                                     cur.execute(
-                                        f"SELECT [__rowid] AS __rowid, [{colmap['VehicleId_Motor']}] AS VehicleId_Motor, [{colmap['Category']}] AS Category, [{colmap['SubCategory']}] AS SubCategory, "
-                                        f"[{colmap['PNCDesc']}] AS PNCDesc, [{colmap['PartNumber']}] AS PartNumber, [{colmap['SubCategory_GPG']}] AS SubCategory_GPG, "
+                                        f"SELECT [__rowid] AS __rowid, [{colmap['PNCDesc']}] AS PNCDesc, [{colmap['PartNumber']}] AS PartNumber, [{colmap['SubCategory_GPG']}] AS SubCategory_GPG, "
                                         f"[{colmap['SearchPartNumber']}] AS SearchPartNumber, [{colmap['PartDescription']}] AS PartDescription, [{colmap['value1']}] AS value1 "
                                         f"FROM [{schema}].[{mod_table}] WHERE [{colmap['VehicleId_Motor']}]=%s AND [{colmap['Category']}]=%s AND [{colmap['SubCategory']}]=%s",
                                         key,
@@ -1760,7 +1786,7 @@ class App:
                             self.log("Stopped by user before scoring")
                             break
                         self.set_stage("PL scoring")
-                        scored, dedup_removed = score_pl_rows(rows, self.kb)
+                        scored, dedup_removed = score_pl_rows(rows, self.kb, category=key[1], subcategory=key[2])
                         duplicates_removed += dedup_removed
                         if dedup_removed > 0:
                             dup_pl_count += 1
@@ -1775,7 +1801,6 @@ class App:
                         # 仅用于定位卡点，不改变业务逻辑：写回-更新
                         self.set_stage("PL writeback: update")
                         with conn.cursor() as cur:
-                            sql = f"UPDATE [{schema}].[{mod_table}] SET [{colmap['like']}]=%s, [{colmap['ispick']}]=%s WHERE [__rowid]=%s"
                             params_list: List[Tuple[Any, Any, Any]] = []
                             for rs in scored:
                                 if self.stop_requested:
@@ -1799,25 +1824,7 @@ class App:
                             if stop_pl:
                                 break
                             if params_list:
-                                if len(params_list) * 3 <= 2000:
-                                    values_sql = ",".join(["(%s,%s,%s)"] * len(params_list))
-                                    flat_params: List[Any] = []
-                                    for p_item in params_list:
-                                        flat_params.extend(p_item)
-                                    sql_values_update = (
-                                        f"UPDATE t SET t.[{colmap['like']}]=v.[like], t.[{colmap['ispick']}]=v.[ispick] "
-                                        f"FROM [{schema}].[{mod_table}] t "
-                                        f"JOIN (VALUES {values_sql}) v([like],[ispick],[__rowid]) ON t.[__rowid]=v.[__rowid]"
-                                    )
-                                    cur.execute(sql_values_update, tuple(flat_params))
-                                    if cur.rowcount not in (-1, len(params_list)):
-                                        note = (q.get("notes") or "") + "|rowcount_mismatch"
-                                        q["notes"] = note[:240]
-                                else:
-                                    cur.executemany(sql, params_list)
-                                    if cur.rowcount not in (-1, len(params_list)):
-                                        note = (q.get("notes") or "") + "|rowcount_mismatch"
-                                        q["notes"] = note[:240]
+                                _update_like_ispick_values(cur, schema, mod_table, colmap["like"], colmap["ispick"], params_list, chunk_rows=600)
 
                             # 仅用于定位卡点，不改变业务逻辑：写回-提交
                             self.set_stage("PL writeback: commit")
