@@ -185,9 +185,29 @@ def load_kb(kb_dir: str) -> Dict[str, Any]:
             if dkey not in canonical_domains:
                 raise RuntimeError(f"domain_boost_rules domain not in domains: {dom}")
             norm_dom = canonical_domains[dkey]
-            domain_boost_rules[norm_dom] = list(rules)
+            out_rules = []
+            for i, rule in enumerate(rules):
+                if not isinstance(rule, dict):
+                    raise RuntimeError(f"domain_boost_rules[{dom}][{i}] must be object")
+                if "domain" in rule and str(rule["domain"]).lower() != dkey:
+                    raise RuntimeError(
+                        f"domain_boost_rules[{dom}][{i}].domain mismatch: {rule['domain']}"
+                    )
+                r2 = dict(rule)
+                r2["domain"] = norm_dom
+                out_rules.append(r2)
+            domain_boost_rules[norm_dom] = out_rules
     else:
         raise RuntimeError("domain_boost_rules.json must be an object or list")
+
+    for dom, rules in domain_boost_rules.items():
+        for i, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                raise RuntimeError(f"domain_boost_rules[{dom}][{i}] must be object")
+            terms = rule.get("tokens") or rule.get("terms") or []
+            if not isinstance(terms, (list, tuple, set)):
+                raise RuntimeError(f"domain_boost_rules[{dom}][{i}] tokens/terms must be list-like")
+            rule["_terms_set"] = {str(x).lower() for x in terms if str(x).strip()}
 
     _validate_required(
         domain_relations,
@@ -228,6 +248,7 @@ def load_kb(kb_dir: str) -> Dict[str, Any]:
             "add": str(rule["add"]).lower(),
             "all": [str(x).lower() for x in all_terms],
             "any": [[str(x).lower() for x in grp] for grp in any_groups],
+            "any_sets": [{str(x).lower() for x in grp} for grp in any_groups],
         }
         normalized_ngrams.append(nr)
 
@@ -388,14 +409,13 @@ def tokenize(s: Optional[str]) -> List[str]:
 
     for rule in KB["ngram_rules"]:
         all_terms = rule.get("all", [])
-        any_groups = rule.get("any", [])
+        any_groups = rule.get("any_sets", [])
         add = rule["add"]
         if all_terms and not all(t in st for t in all_terms):
             continue
         ok_any = True
         if any_groups:
-            for g in any_groups:
-                gset = set(g)
+            for gset in any_groups:
                 if not (st & gset):
                     ok_any = False
                     break
@@ -415,7 +435,7 @@ def domain_tag(tokens: List[str]) -> str:
         for r in KB["domain_boost_rules"].get(dom, []):
             mode = str(r.get("mode", "")).lower()
             add = int(r.get("add", 0))
-            terms = _as_lower_set(r.get("tokens") or r.get("terms") or [])
+            terms = r.get("_terms_set", set())
             if mode == "any" and (toks & terms):
                 score += add
             elif mode == "all" and terms and terms.issubset(toks):
@@ -706,11 +726,9 @@ def candidate_pls(
     if len(cand) < 12:
         if dom_hint in domain_sorted[vid]:
             cand += domain_sorted[vid][dom_hint][:max_fallback]
-        canonical_map = KB["domain_relations"].get("canonical_map", {})
         for nb in KB["domain_relations"]["candidate_fallback_neighbors"].get(_dom_key(dom_hint), []):
-            nb_canon = canonical_map.get(_dom_key(nb), nb)
             for actual_dom in domain_sorted[vid].keys():
-                if _dom_key(actual_dom) == _dom_key(nb_canon):
+                if _dom_key(actual_dom) == nb:
                     cand += domain_sorted[vid][actual_dom][:max_fallback]
         if not cand:
             cand += pl_by_vehicle.get(vid, [])[:max_fallback]
