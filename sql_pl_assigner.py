@@ -930,12 +930,28 @@ def load_df(conn, schema: str, table: str, cols: List[str]) -> pd.DataFrame:
         return pd.read_sql(f"SELECT {sel} FROM {_qt(schema, table)}", conn)
 
 
-def _update_done_values(cur, schema: str, table: str, rowid_key: str, params_list: List[Tuple[str, str, int, int]], chunk_rows: int = CHUNK_VALUES):
+def _update_done_values(
+    cur,
+    schema: str,
+    table: str,
+    rowid_key: str,
+    params_list: List[Tuple[str, str, int, int]],
+    chunk_rows: int = CHUNK_VALUES,
+    progress=None,  # progress(cur_n:int, total_n:int)
+):
     if not params_list:
+        if progress:
+            progress(0, 0)
         return
-    head = f"UPDATE t SET t.[Category]=v.[Category], t.[SubCategory]=v.[SubCategory], t.[like]=v.[like] FROM {_qt(schema, table)} t JOIN (VALUES "
+
+    head = (
+        f"UPDATE t SET t.[Category]=v.[Category], t.[SubCategory]=v.[SubCategory], t.[like]=v.[like] "
+        f"FROM {_qt(schema, table)} t JOIN (VALUES "
+    )
     tail = f") v([Category],[SubCategory],[like],[{rowid_key}]) ON t.[{rowid_key}]=v.[{rowid_key}]"
     n = len(params_list)
+
+    done = 0
     for off in range(0, n, chunk_rows):
         chunk = params_list[off : off + chunk_rows]
         values_sql = ",".join(["(%s,%s,%s,%s)"] * len(chunk))
@@ -943,6 +959,11 @@ def _update_done_values(cur, schema: str, table: str, rowid_key: str, params_lis
         for a, b, c, d in chunk:
             flat.extend((a, b, c, d))
         cur.execute(head + values_sql + tail, tuple(flat))
+
+        done += len(chunk)
+        if progress:
+            progress(done, n)
+
 
 
 # ============================
@@ -1004,6 +1025,7 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
             row_fast_no_loc = [False] * N
 
             push("构建候选", 0, N if N else 1, "building options")
+            step = max(1, N // 200)  # 最多刷新约200次；N小会更细，避免开局跳半屏
             for i in range(N):
                 spn = spn_arr[i]
                 if spn:
@@ -1032,7 +1054,9 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
                     if opts:
                         opts.sort(key=lambda x: (x[1], x[2], x[3], pl_recs[x[0]].remain, row_v1[i], pl_recs[x[0]].sub), reverse=True)
                         row_options[i] = opts[:12]
-                if (i % 500 == 0) or (i == N - 1):
+
+                # ✅ 自适应刷新
+                if i == 0 or ((i + 1) % step == 0) or (i == N - 1):
                     push("构建候选", i + 1, N if N else 1, f"{i + 1}/{N}")
 
             push("统计SPN", 0, 1, "aggregate spn")
@@ -1219,13 +1243,25 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
                         fast_no_loc_selected += 1
                     like_vals[rid] = int(like)
 
-            push("写回SQL", 0, 1, "writing values")
             params = []
             for rid, pid in selected_pl_for_row.items():
                 params.append((pl_recs[pid].cat, pl_recs[pid].sub, int(like_vals[rid]), int(rid_arr[rid])))
+
+            total_rows = len(params) if params else 1
+            push("写回SQL", 0, total_rows, f"0/{len(params)}")
+
             with conn.cursor() as cur:
-                _update_done_values(cur, done_schema, done_table, rowid_key, params, CHUNK_VALUES)
+                _update_done_values(
+                    cur,
+                    done_schema,
+                    done_table,
+                    rowid_key,
+                    params,
+                    CHUNK_VALUES,
+                    progress=lambda cur_n, tot_n: push("写回SQL", cur_n, tot_n if tot_n else 1, f"{cur_n}/{tot_n}"),
+                )
             conn.commit()
+            push("写回SQL", len(params), total_rows, f"{len(params)}/{len(params)}")
 
             X = len(spn_to_rows)
             Y = len(selected_pl_for_row)
@@ -1490,6 +1526,11 @@ class UI:
     def start(self):
         if self.running:
             return
+        try:
+            while True:
+                self.q.get_nowait()
+        except queue.Empty:
+            pass
         db = self.db.get().strip()
         parts = self.parts.get().strip()
         pl = self.pl.get().strip()
@@ -1527,30 +1568,49 @@ class UI:
         th.start()
 
     def poll(self):
+        last_progress = None
+        max_drain = 200  # 每次最多处理200条消息，防止UI线程被队列淹没
+
         try:
-            while True:
+            for _ in range(max_drain):
                 msg = self.q.get_nowait()
+
                 if msg[0] == "progress":
-                    _, stage, cur, total, info = msg
-                    pct = 0 if total <= 0 else min(100.0, (cur / total) * 100.0)
-                    self.pbar["value"] = pct
-                    self.status.set(f"KB loaded: {self.kb_version.get()} | {stage} {cur}/{total} {info}".strip())
-                    if cur == 0 or cur == total or (cur % 2000 == 0):
-                        self._log(f"[{stage}] {cur}/{total} {info}".strip())
-                elif msg[0] == "error":
+                    last_progress = msg  # 只保留最后一条进度，避免频繁刷新
+                    continue
+
+                if msg[0] == "error":
                     self.running = False
                     self.status.set(f"KB loaded: {self.kb_version.get()} | 错误")
                     self._log("ERROR: " + msg[1])
                     messagebox.showerror("错误", msg[1])
-                elif msg[0] == "done":
+                    last_progress = None
+                    break
+
+                if msg[0] == "done":
                     self.running = False
                     self.pbar["value"] = 100
                     self.status.set(f"KB loaded: {self.kb_version.get()} | 完成")
                     self._log("DONE")
                     self._log(msg[1])
                     messagebox.showinfo("完成", msg[1])
+                    last_progress = None
+                    break
+
         except queue.Empty:
             pass
+
+        # 统一在最后更新一次进度UI
+        if last_progress is not None:
+            _, stage, cur, total, info = last_progress
+            pct = 0 if total <= 0 else min(100.0, (cur / total) * 100.0)
+            self.pbar["value"] = pct
+            self.status.set(f"KB loaded: {self.kb_version.get()} | {stage} {cur}/{total} {info}".strip())
+
+            # 日志不要太频繁
+            if cur == total or cur == 0 or (cur % 2000 == 0):
+                self._log(f"[{stage}] {cur}/{total} {info}".strip())
+
         self.root.after(60, self.poll)
 
 
