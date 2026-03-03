@@ -378,9 +378,14 @@ def ensure_kb_loaded():
         raise RuntimeError("KB not loaded. Please load KB first.")
 
 
+def _stable_text(v: Optional[str]) -> str:
+    if pd.isna(v):
+        return ""
+    return str(v)
+
 
 def norm_text(s: Optional[str]) -> str:
-    if s is None:
+    if s is None or pd.isna(s):
         return ""
     s = str(s).lower()
     s = s.replace("a/c", "ac").replace("a-c", "ac").replace("w/", "with ").replace("wo/", "without ")
@@ -558,11 +563,13 @@ LEGACY_CACHE_MAX = 200000
 
 
 def desc_features(pnc: Optional[str], desc: Optional[str]):
-    key = (pnc or "", desc or "")
+    pnc_s = _stable_text(pnc)
+    desc_s = _stable_text(desc)
+    key = (pnc_s, desc_s)
     v = _desc_cache.get(key)
     if v is not None:
         return v
-    toks = tokenize((pnc or "") + " " + (desc or ""))
+    toks = tokenize(pnc_s + " " + desc_s)
     dset = set(toks)
     has_loc = any(t in LOC_TOKENS for t in toks)
     fast_present = any(t in FASTENER_TOKENS for t in toks)
@@ -600,11 +607,11 @@ def desc_features(pnc: Optional[str], desc: Optional[str]):
 
 
 def legacy_features(subcat_gpg: Optional[str]):
-    key = subcat_gpg or ""
+    key = _stable_text(subcat_gpg)
     v = _legacy_cache.get(key)
     if v is not None:
         return v
-    s = str(subcat_gpg or "")
+    s = key
     ps = s.split("/")
     segs = []
     if ps and ps[-1]:
@@ -934,13 +941,13 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
 
             N = len(parts)
             rid_arr = parts["__rowid"].tolist()
-            spn_arr = parts.get("SearchPartNumber", "").astype(str).tolist()
-            vid_arr = parts.get("VehicleId_Motor", "").astype(str).tolist()
-            subgpg_arr = parts.get("SubCategory_GPG", "").tolist()
-            pnc_arr = parts.get("PNCDesc", "").tolist()
-            pdesc_arr = parts.get("PartDescription", "").tolist()
+            spn_arr = parts.get("SearchPartNumber", "").fillna("").astype(str).tolist()
+            vid_arr = parts.get("VehicleId_Motor", "").fillna("").astype(str).tolist()
+            subgpg_arr = parts.get("SubCategory_GPG", "").fillna("").astype(str).tolist()
+            pnc_arr = parts.get("PNCDesc", "").fillna("").astype(str).tolist()
+            pdesc_arr = parts.get("PartDescription", "").fillna("").astype(str).tolist()
             row_v1 = parts["value1_num"].tolist()
-            row_partnum = parts.get("PartNumber", "").astype(str).tolist()
+            row_partnum = parts.get("PartNumber", "").fillna("").astype(str).tolist()
 
             spn_to_rows = collections.defaultdict(list)
             row_options = [[] for _ in range(N)]
