@@ -1247,21 +1247,24 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
             for rid, pid in selected_pl_for_row.items():
                 params.append((pl_recs[pid].cat, pl_recs[pid].sub, int(like_vals[rid]), int(rid_arr[rid])))
 
-            total_rows = len(params) if params else 1
-            push("写回SQL", 0, total_rows, f"0/{len(params)}")
+            if not params:
+                push("写回SQL", 1, 1, "")
+            else:
+                total_rows = len(params)
+                push("写回SQL", 0, total_rows, "")
 
-            with conn.cursor() as cur:
-                _update_done_values(
-                    cur,
-                    done_schema,
-                    done_table,
-                    rowid_key,
-                    params,
-                    CHUNK_VALUES,
-                    progress=lambda cur_n, tot_n: push("写回SQL", cur_n, tot_n if tot_n else 1, f"{cur_n}/{tot_n}"),
-                )
-            conn.commit()
-            push("写回SQL", len(params), total_rows, f"{len(params)}/{len(params)}")
+                with conn.cursor() as cur:
+                    _update_done_values(
+                        cur,
+                        done_schema,
+                        done_table,
+                        rowid_key,
+                        params,
+                        CHUNK_VALUES,
+                        progress=lambda cur_n, tot_n: push("写回SQL", cur_n, tot_n if tot_n else 1, ""),
+                    )
+                conn.commit()
+                push("写回SQL", total_rows, total_rows, "")
 
             X = len(spn_to_rows)
             Y = len(selected_pl_for_row)
@@ -1315,6 +1318,7 @@ class UI:
         self.q = queue.Queue()
         self.running = False
         self.logged_in = False
+        self._last_stage = None
 
         self.host = tk.StringVar(value="")
         self.user = tk.StringVar(value="")
@@ -1372,18 +1376,34 @@ class UI:
         self.log = tk.Text(self.root, height=22, wrap="word")
         self.log.pack(fill="both", expand=True, padx=12, pady=(6, 10))
         self._log("Ready")
-        self._log("请先加载KB")
+        self._log("KB可稍后加载；开始运行前必须加载KB")
         self._set_controls_for_kb(False)
 
         self.root.after(60, self.poll)
 
     def _set_controls_for_kb(self, loaded: bool):
-        self.btn_login.config(state="normal" if loaded else "disabled")
-        self.btn_tables.config(state="disabled")
-        self.db_combo.config(state="disabled")
-        self.parts_combo.config(state="disabled")
-        self.pl_combo.config(state="disabled")
-        self.btn_start.config(state="disabled")
+        # KB是否加载不再控制登录/选库；只在运行时检查
+        self.btn_login.config(state="normal")
+
+        # 登录后：允许选择数据库 + 加载表
+        if self.logged_in:
+            self.db_combo.config(state="readonly")
+            self.btn_tables.config(state="normal")
+        else:
+            self.db_combo.config(state="disabled")
+            self.btn_tables.config(state="disabled")
+
+        # 表列表加载后：允许选择Parts/PL + Start
+        has_tables = bool(self.parts_combo["values"]) and bool(self.pl_combo["values"])
+        if has_tables:
+            self.parts_combo.config(state="readonly")
+            self.pl_combo.config(state="readonly")
+            self.btn_start.config(state="normal")
+        else:
+            self.parts_combo.config(state="disabled")
+            self.pl_combo.config(state="disabled")
+            self.btn_start.config(state="disabled")
+
 
     def choose_kb_dir(self):
         p = filedialog.askdirectory()
@@ -1445,21 +1465,9 @@ class UI:
             kb = load_kb(kb_dir)
             apply_kb(kb)
             self.kb_version.set(kb["version"])
-            self._set_controls_for_kb(True)
-            self.logged_in = False
-            self.db_combo["values"] = []
-            self.parts_combo["values"] = []
-            self.pl_combo["values"] = []
-            self.db.set("")
-            self.parts.set("")
-            self.pl.set("")
-            self.db_combo.config(state="disabled")
-            self.parts_combo.config(state="disabled")
-            self.pl_combo.config(state="disabled")
-            self.btn_tables.config(state="disabled")
-            self.btn_start.config(state="disabled")
-            self.status.set(f"KB loaded: {kb['version']} | 请重新登录并加载表列表")
+            self.status.set(f"KB loaded: {kb['version']} | 可继续登录/选表；开始运行时会检查KB")
             self._log(f"KB loaded: {kb['version']}")
+            self._set_controls_for_kb(True)
         except Exception as e:
             self._set_controls_for_kb(False)
             self.status.set("KB加载失败")
@@ -1531,6 +1539,9 @@ class UI:
                 self.q.get_nowait()
         except queue.Empty:
             pass
+        if KB is None:
+            messagebox.showwarning("提示", "尚未加载KB：可以先登录/选表，但开始运行前必须加载KB。")
+            return
         db = self.db.get().strip()
         parts = self.parts.get().strip()
         pl = self.pl.get().strip()
@@ -1576,7 +1587,7 @@ class UI:
                 msg = self.q.get_nowait()
 
                 if msg[0] == "progress":
-                    last_progress = msg  # 只保留最后一条进度，避免频繁刷新
+                    last_progress = msg  # 只保留最后一条进度
                     continue
 
                 if msg[0] == "error":
@@ -1600,16 +1611,26 @@ class UI:
         except queue.Empty:
             pass
 
-        # 统一在最后更新一次进度UI
         if last_progress is not None:
             _, stage, cur, total, info = last_progress
             pct = 0 if total <= 0 else min(100.0, (cur / total) * 100.0)
             self.pbar["value"] = pct
-            self.status.set(f"KB loaded: {self.kb_version.get()} | {stage} {cur}/{total} {info}".strip())
 
-            # 日志不要太频繁
-            if cur == total or cur == 0 or (cur % 2000 == 0):
-                self._log(f"[{stage}] {cur}/{total} {info}".strip())
+            # 写回SQL：不刷文字（只在阶段切换时刷一次）
+            if stage == "写回SQL":
+                if self._last_stage != stage:
+                    self.status.set(f"KB loaded: {self.kb_version.get()} | 写回SQL...")
+                    self._log("[写回SQL] start")
+                    self._last_stage = stage
+                # 不再更新status文字、不打日志
+            else:
+                self.status.set(f"KB loaded: {self.kb_version.get()} | {stage} {cur}/{total} {info}".strip())
+                if self._last_stage != stage:
+                    self._log(f"[{stage}] start")
+                    self._last_stage = stage
+                # 日志不要太频繁
+                if cur == total or cur == 0 or (cur % 2000 == 0):
+                    self._log(f"[{stage}] {cur}/{total} {info}".strip())
 
         self.root.after(60, self.poll)
 
