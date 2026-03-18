@@ -794,10 +794,24 @@ def eval_option(row_feat, leg_feat, pl: PLRec, std_pls_for_vid: Set[int]):
                 return None
     if pl_guard_reject(desc_set, pl):
         return None
-    lr = 3 if strong_overlap >= 2 else (2 if strong_overlap == 1 else 1)
-    if lr == 1 and legacy_conf >= 2 and legacy_dom not in (UNKNOWN_NAME, CONFLICT_NAME):
-        if pl.dom != legacy_dom and not neighbor_allowed(legacy_dom, pl.dom, desc_set, set(pl.subtoks)):
-            return None
+    if dom_evidence not in (UNKNOWN_NAME, CONFLICT_NAME):
+        same_dom = (_dom_key(pl.dom) == _dom_key(dom_evidence))
+    elif legacy_conf >= 2 and legacy_dom not in (UNKNOWN_NAME, CONFLICT_NAME):
+        same_dom = (_dom_key(pl.dom) == _dom_key(legacy_dom))
+    else:
+        same_dom = False
+    if strong_overlap >= 2:
+        lr = 3
+    elif strong_overlap == 1:
+        lr = 2
+    elif compat_key == 1:
+        lr = 1
+    elif same_dom:
+        lr = 1
+    else:
+        return None
+    if lr == 1 and legacy_conf >= 2 and legacy_dom not in (UNKNOWN_NAME, CONFLICT_NAME) and _dom_key(pl.dom) != _dom_key(legacy_dom) and compat_key == 0:
+        return None
     legacy_score = legacy_conf * 2
     return (lr, strong_overlap, legacy_score, legacy_conf, compat_key)
 
@@ -1217,6 +1231,8 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
                             continue
                         if rid in selected_pl_for_row:
                             continue
+                        if spn and spn in picked_global:
+                            continue
                         if lr == 1:
                             ev_dom = row_dom_ev[rid]
                             if ev_dom not in (UNKNOWN_NAME, CONFLICT_NAME):
@@ -1235,6 +1251,7 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
                         rem -= 1
                         if spn:
                             pl_used_spn[pid].add(spn)
+                            picked_global.add(spn)
                         if lr == 1 and pl_recs[pid].is_sink == 1:
                             pl_lr1_sink_used[pid] += 1
 
