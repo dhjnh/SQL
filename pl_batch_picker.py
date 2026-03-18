@@ -41,6 +41,13 @@ NOISE_TOKENS = {
     "w", "w_", "w__", "w___",
 }
 
+# PL 选取参数：控制每个 PL 最多选取数量，以及覆盖率优先策略的开关/容忍度，便于后续手工调参。
+PL_PICK_MAX = 10
+COVERAGE_PRIORITY_ENABLED = True
+COVERAGE_LIKE_TOLERANCE = 3
+PREFER_NEW_SPN_IN_SAME_PL = True
+PREFER_GLOBAL_UNPICKED_SPN = True
+
 
 @dataclass
 class RowScore:
@@ -1013,23 +1020,36 @@ def pick_ispick(rows: List[RowScore], global_picked_spn: Set[str]) -> None:
     def fill(pool: List[RowScore], allow_t3: bool = False):
         nonlocal picked
         pool = sorted(pool, key=lambda x: (x.like, x.score_desc, x.score_term, x.score_value), reverse=True)
-        while pool and len(picked) < 10:
-            best = pool[0]
-            best_like = best.like
-            choose = best
+        while pool and len(picked) < PL_PICK_MAX:
+            best_like = max(x.like for x in pool)
+            tolerance_floor = best_like - COVERAGE_LIKE_TOLERANCE
+            picked_spn = {_norm_text(x.row.get("SearchPartNumber")) for x in picked}
 
-            # 覆盖优先：在不降质（最多让步3分）前提下优先选未覆盖SPN
-            for cand in pool:
+            def _eligible_for_coverage(cand: RowScore) -> bool:
+                return (not COVERAGE_PRIORITY_ENABLED) or (cand.like >= tolerance_floor)
+
+            def _priority_tuple(cand: RowScore) -> Tuple[Any, ...]:
                 cand_spn = _norm_text(cand.row.get("SearchPartNumber"))
-                if any(_norm_text(x.row.get("SearchPartNumber")) == cand_spn for x in picked):
-                    continue
-                if cand_spn and cand_spn not in global_picked_spn and cand.like >= best_like - 3:
-                    choose = cand
-                    break
+                global_unpicked = 0
+                same_pl_new = 0
+                if COVERAGE_PRIORITY_ENABLED and _eligible_for_coverage(cand):
+                    if PREFER_GLOBAL_UNPICKED_SPN and cand_spn and cand_spn not in global_picked_spn:
+                        global_unpicked = 1
+                    if PREFER_NEW_SPN_IN_SAME_PL and cand_spn and cand_spn not in picked_spn:
+                        same_pl_new = 1
+                return (
+                    cand.like,
+                    global_unpicked,
+                    same_pl_new,
+                    cand.score_desc,
+                    cand.score_term,
+                    cand.score_value,
+                )
 
+            choose = max(pool, key=_priority_tuple)
             pool.remove(choose)
             choose_spn = _norm_text(choose.row.get("SearchPartNumber"))
-            if any(_norm_text(x.row.get("SearchPartNumber")) == choose_spn for x in picked):
+            if PREFER_NEW_SPN_IN_SAME_PL and choose_spn and choose_spn in picked_spn:
                 continue
             if not allow_t3 and choose in tier3:
                 continue
@@ -1039,10 +1059,10 @@ def pick_ispick(rows: List[RowScore], global_picked_spn: Set[str]) -> None:
 
     fill(tier1)
     fill(tier2)
-    if len(picked) < 10:
+    if len(picked) < PL_PICK_MAX:
         fill(tier3, allow_t3=True)
 
-    for p in picked[:10]:
+    for p in picked[:PL_PICK_MAX]:
         p.row["_ispick"] = 1
 
 
@@ -1865,7 +1885,7 @@ class App:
                         pick_ispick(scored, global_picked)
                         picked_now = sum(1 for r in scored if r.row.get("_ispick") == 1)
                         selected_count += picked_now
-                        if picked_now == 10:
+                        if picked_now == PL_PICK_MAX:
                             full_10_count += 1
                         if picked_now == 0:
                             empty_pl_count += 1
@@ -1970,7 +1990,7 @@ class App:
             selected_unique_spn = len(global_picked)
             summary = (
                 f"总PL={total}, DONE={processed_total}, 本次新处理PL数={processed_new}, ispick=1总行数={selected_count}, 未选中PL数={empty_pl_count}, "
-                f"选满10个PL数={full_10_count}, 平均每PL选中数={avg_pick}\n"
+                f"选满{PL_PICK_MAX}个PL数={full_10_count}, 平均每PL选中数={avg_pick}\n"
                 f"选中去重SPN后数量={selected_unique_spn}\n"
                 f"当前完整表格内去重SPN数量={full_table_unique_spn}\n"
                 f"总处理用时={elapsed_used_txt}\n"
