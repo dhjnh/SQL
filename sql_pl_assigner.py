@@ -28,6 +28,7 @@ import pymssql
 TDS_VERSION = "7.0"
 DONE_SUFFIX = "_Done"
 CHUNK_VALUES = 500  # UPDATE VALUES 每批行数
+PL_PICK_LIMIT = 10  # 单个PL内选择上限，便于集中调参
 DEFAULT_KB_DIR = "./kb_v4.3_local_flex"
 
 PUNCT_RE = re.compile(r"[-_/()\[\],\.]")
@@ -344,7 +345,7 @@ PLURAL_EXCEPT = set()
 TOKEN_ALIAS = {}
 KEY_WHITELIST = set()
 WEAK_OVERLAP = set()
-PL_CAP = 10
+PL_CAP = PL_PICK_LIMIT
 UNKNOWN_NAME = "Unknown"
 FASTENER_NAME = "Fastener/Standard"
 CONFLICT_NAME = "Conflict"
@@ -365,7 +366,7 @@ def apply_kb(kb: Dict[str, Any]):
     TOKEN_ALIAS = KB["token_alias"]
     KEY_WHITELIST = KB["lists"]["key_whitelist"]
     WEAK_OVERLAP = KB["lists"]["weak_overlap"]
-    PL_CAP = KB["pl_cap"]
+    PL_CAP = PL_PICK_LIMIT
     UNKNOWN_NAME = KB["domain_relations"]["special_domain_names"]["unknown"]
     FASTENER_NAME = KB["domain_relations"]["special_domain_names"]["fastener"]
     CONFLICT_NAME = KB["domain_relations"]["special_domain_names"].get("conflict", "Conflict")
