@@ -1222,7 +1222,7 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
                 if not cands:
                     continue
 
-                def try_pick(filter_lr, allow_fast_no_loc):
+                def try_pick(filter_lr, allow_fast_no_loc, allow_global_reuse, require_global_used):
                     nonlocal rem
                     for lr, ov, ls, v1, fnl, rid, spn in cands:
                         if rem <= 0:
@@ -1231,7 +1231,12 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
                             continue
                         if rid in selected_pl_for_row:
                             continue
-                        if spn and spn in picked_global:
+                        if spn and spn in pl_used_spn[pid]:
+                            continue
+                        if require_global_used:
+                            if (not spn) or (spn not in picked_global):
+                                continue
+                        if (not allow_global_reuse) and spn and spn in picked_global:
                             continue
                         if lr == 1:
                             ev_dom = row_dom_ev[rid]
@@ -1241,8 +1246,6 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
                                         continue
                             if pl_recs[pid].is_sink == 1 and pl_lr1_sink_used[pid] >= 1:
                                 continue
-                        if spn and spn in pl_used_spn[pid]:
-                            continue
                         if fnl and (not allow_fast_no_loc):
                             continue
                         selected_pl_for_row[rid] = pid
@@ -1255,11 +1258,13 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
                         if lr == 1 and pl_recs[pid].is_sink == 1:
                             pl_lr1_sink_used[pid] += 1
 
-                try_pick({3, 2}, True)
+                try_pick({3, 2}, True, False, False)
                 if rem > 0:
-                    try_pick({1}, False)
+                    try_pick({1}, False, False, False)
                 if rem > 0:
-                    try_pick({1}, True)
+                    try_pick({1}, True, False, False)
+                if rem > 0:
+                    try_pick({3, 2}, False, True, True)
                 if (idx % 200 == 0) or (idx == len(pl_ids_3c) - 1):
                     push("3C补满", idx + 1, len(pl_ids_3c) if pl_ids_3c else 1, "")
 
