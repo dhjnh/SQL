@@ -28,7 +28,7 @@ import pymssql
 TDS_VERSION = "7.0"
 DONE_SUFFIX = "_Done"
 CHUNK_VALUES = 500  # UPDATE VALUES 每批行数
-PL_PICK_LIMIT = 10  # 单个PL内选择上限，便于集中调参
+DEFAULT_PL_PICK_LIMIT = 10  # 单个PL内选择上限默认值，便于集中调参
 DEFAULT_KB_DIR = "./kb_v4.3_local_flex"
 
 PUNCT_RE = re.compile(r"[-_/()\[\],\.]")
@@ -345,7 +345,6 @@ PLURAL_EXCEPT = set()
 TOKEN_ALIAS = {}
 KEY_WHITELIST = set()
 WEAK_OVERLAP = set()
-PL_CAP = PL_PICK_LIMIT
 UNKNOWN_NAME = "Unknown"
 FASTENER_NAME = "Fastener/Standard"
 CONFLICT_NAME = "Conflict"
@@ -353,7 +352,7 @@ CONFLICT_NAME = "Conflict"
 
 def apply_kb(kb: Dict[str, Any]):
     global KB, NOISE, LOC_TOKENS, FORM_TOKENS, FASTENER_TOKENS, STANDARD_WORDS
-    global COMPAT_IGNORE, PLURAL_EXCEPT, TOKEN_ALIAS, KEY_WHITELIST, WEAK_OVERLAP, PL_CAP
+    global COMPAT_IGNORE, PLURAL_EXCEPT, TOKEN_ALIAS, KEY_WHITELIST, WEAK_OVERLAP
     global UNKNOWN_NAME, FASTENER_NAME, CONFLICT_NAME
     KB = kb
     NOISE = KB["lists"]["noise"]
@@ -366,7 +365,6 @@ def apply_kb(kb: Dict[str, Any]):
     TOKEN_ALIAS = KB["token_alias"]
     KEY_WHITELIST = KB["lists"]["key_whitelist"]
     WEAK_OVERLAP = KB["lists"]["weak_overlap"]
-    PL_CAP = PL_PICK_LIMIT
     UNKNOWN_NAME = KB["domain_relations"]["special_domain_names"]["unknown"]
     FASTENER_NAME = KB["domain_relations"]["special_domain_names"]["fastener"]
     CONFLICT_NAME = KB["domain_relations"]["special_domain_names"].get("conflict", "Conflict")
@@ -663,13 +661,13 @@ def legacy_features(subcat_gpg: Optional[str]):
     return v
 
 
-def build_pl_index(pl_df: pd.DataFrame):
+def build_pl_index(pl_df: pd.DataFrame, pl_cap: int):
     pl_df = pl_df.copy()
     sink_tokens = {"hydraulic", "pulleys", "pulley", "moldings", "molding", "system", "components"}
     if "allready_Pick" not in pl_df.columns:
         pl_df["allready_Pick"] = 0
     pl_df["allready_Pick"] = pd.to_numeric(pl_df["allready_Pick"], errors="coerce").fillna(0).astype(int)
-    pl_df["RemainSlots"] = (PL_CAP - pl_df["allready_Pick"]).clip(lower=0).astype(int)
+    pl_df["RemainSlots"] = (pl_cap - pl_df["allready_Pick"]).clip(lower=0).astype(int)
     pl_recs = {}
     pl_by_vehicle = collections.defaultdict(list)
     token_index = collections.defaultdict(lambda: collections.defaultdict(list))
@@ -992,7 +990,7 @@ def _update_done_values(
 # ============================
 # Core job
 # ============================
-def run_job(host: str, user: str, password: str, database: str, parts_full: str, pl_full: str, overwrite_done: bool, progq: "queue.Queue"):
+def run_job(host: str, user: str, password: str, database: str, parts_full: str, pl_full: str, overwrite_done: bool, pl_pick_limit: int, progq: "queue.Queue"):
     ensure_kb_loaded()
     t0 = time.time()
 
@@ -1030,7 +1028,7 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
 
             parts["value1_num"] = pd.to_numeric(parts["value1"], errors="coerce").fillna(0).astype(int)
 
-            pl_recs, pl_by_vehicle, token_index, domain_sorted, std_pls = build_pl_index(pl)
+            pl_recs, pl_by_vehicle, token_index, domain_sorted, std_pls = build_pl_index(pl, pl_pick_limit)
             candidate_vids = set(pl_by_vehicle.keys())
 
             N = len(parts)
@@ -1335,6 +1333,7 @@ def run_job(host: str, user: str, password: str, database: str, parts_full: str,
                     f"- 本次选中去重SPN数量：{Z}",
                     f"- 覆盖率：{R:.4f}",
                     f"- Fastener无位置限定入选行数：{fast_no_loc_selected}",
+                    f"- 本次运行PL上限：{pl_pick_limit}",
                     f"Done. elapsed_s={time.time() - t0:.1f}",
                 ]
             )
@@ -1391,6 +1390,7 @@ class UI:
         self.pl = tk.StringVar(value="")
         self.kb_path = tk.StringVar(value=os.environ.get("KB_DIR", DEFAULT_KB_DIR))
         self.kb_version = tk.StringVar(value="未加载")
+        self.pl_pick_limit = tk.StringVar(value=str(DEFAULT_PL_PICK_LIMIT))
 
         top = ttk.Frame(self.root, padding=10)
         top.pack(fill="x")
@@ -1418,6 +1418,8 @@ class UI:
 
         self.btn_tables = tk.Button(top, text="加载表列表", width=12, state="disabled", command=self.load_tables)
         self.btn_tables.grid(row=2, column=2, sticky="w", padx=(12, 0))
+        ttk.Label(top, text="PL上限", width=8).grid(row=2, column=3, sticky="w", padx=(12, 0))
+        ttk.Entry(top, textvariable=self.pl_pick_limit, width=10).grid(row=2, column=4, sticky="w")
 
         ttk.Label(top, text="PartsTable", width=8).grid(row=3, column=0, sticky="w", pady=3)
         self.parts_combo = ttk.Combobox(top, textvariable=self.parts, width=60, state="disabled")
@@ -1622,8 +1624,20 @@ class UI:
         db = self.db.get().strip()
         parts = self.parts.get().strip()
         pl = self.pl.get().strip()
+        pl_pick_limit_raw = self.pl_pick_limit.get().strip()
         if not db or not parts or not pl:
             messagebox.showwarning("提示", "请选择 Database / PartsTable / PLTable")
+            return
+        if not pl_pick_limit_raw:
+            messagebox.showwarning("提示", "请填写PL上限")
+            return
+        try:
+            pl_pick_limit = int(pl_pick_limit_raw)
+        except ValueError:
+            messagebox.showwarning("提示", "PL上限必须是整数")
+            return
+        if pl_pick_limit <= 0:
+            messagebox.showwarning("提示", "PL上限必须大于0")
             return
 
         ps, pt = _split_schema_table(parts)
@@ -1646,7 +1660,7 @@ class UI:
         self.running = True
         self.pbar["value"] = 0
         self.status.set(f"{self._kb_label()} | 运行中...")
-        self._log(f"DB={db} Parts={parts} PL={pl} Out={done} Overwrite={overwrite}")
+        self._log(f"DB={db} Parts={parts} PL={pl} Out={done} Overwrite={overwrite} PLPickLimit={pl_pick_limit}")
 
         # reset UI progress cache (避免上次残留导致跳阶段/不显示)
         self._last_stage = None
@@ -1659,7 +1673,7 @@ class UI:
 
         th = threading.Thread(
             target=run_job,
-            args=(self.host.get().strip(), self.user.get().strip(), self.pwd.get(), db, parts, pl, overwrite, self.q),
+            args=(self.host.get().strip(), self.user.get().strip(), self.pwd.get(), db, parts, pl, overwrite, pl_pick_limit, self.q),
             daemon=True,
         )
         th.start()
