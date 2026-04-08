@@ -1653,8 +1653,8 @@ class App:
 
     def run_main(self):
         self.set_progress_indeterminate(True)
-        self.set_stage("checking resume / existing progress")
-        self.log("checking resume / existing progress")
+        self.set_stage("检查是否存在续跑进度")
+        self.log("检查是否存在续跑进度")
         schema = self.schema.get().strip()
         table = self.table.get().strip()
         mod_table = f"{table}_Mod"
@@ -1663,8 +1663,8 @@ class App:
         build_to_pl_started_at = None
 
         def _generate_queue(conn, cmap):
-            self.set_stage("generating PL queue")
-            self.log("generating PL queue")
+            self.set_stage("生成 PL 队列")
+            self.log("生成 PL 队列")
             with conn.cursor(as_dict=True) as cur:
                 cur.execute(
                     f"SELECT [{cmap['VehicleId_Motor']}] AS VehicleId_Motor, [{cmap['Category']}] AS Category, [{cmap['SubCategory']}] AS SubCategory, COUNT(*) AS row_cnt "
@@ -1678,7 +1678,7 @@ class App:
                 w.writeheader()
                 for q in queues:
                     w.writerow({**q, "status": "PENDING", "processed_at": "", "notes": ""})
-            self.log(f"Generated queue: {len(queues)} PL")
+            self.log(f"已生成队列：{len(queues)} 个 PL")
 
         with self.connect() as conn:
             with conn.cursor() as cur:
@@ -1703,20 +1703,28 @@ class App:
 
             resume_possible = queue_exists or log_exists or mod_exists or has_trace
             if resume_possible:
-                details = ["Detected previous progress:"]
+                details = ["检测到历史运行痕迹：", ""]
                 if queue_exists:
-                    details.append(f"- {queue_file.name} exists")
+                    details.append(f"- 存在队列文件：{queue_file.name}")
                 if log_exists:
-                    details.append(f"- {queue_file.name}.log exists")
+                    details.append(f"- 存在队列日志：{queue_file.name}.log")
                 if mod_exists:
-                    details.append(f"- table {schema}.{mod_table} exists")
+                    details.append(f"- 存在结果表：{schema}.{mod_table}")
                 if has_trace:
-                    details.append("- _Mod has processed traces (ispick=1 or like not null)")
-                details.append("Continue from last progress?")
-                resume_choice = self.ui_call_blocking(lambda: messagebox.askyesnocancel("Resume?", "\n".join(details)))
+                    details.append("- 结果表中已存在处理痕迹（ispick=1 或 like 非空）")
+                details.extend(
+                    [
+                        "",
+                        "请选择后续操作：",
+                        "是：继续上次进度",
+                        "否：重新开始（清理旧队列/日志，并重建 _Mod）",
+                        "取消：本次不执行任何操作",
+                    ]
+                )
+                resume_choice = self.ui_call_blocking(lambda: messagebox.askyesnocancel("检测到历史进度", "\n".join(details)))
                 if resume_choice is None:
-                    self.log("User cancelled; exiting without changes")
-                    self.ui(self.root.destroy)
+                    self.log("用户取消，本次不执行任何操作")
+                    self.set_progress_indeterminate(False)
                     return
                 resume_mode = bool(resume_choice)
             else:
@@ -1726,49 +1734,44 @@ class App:
                 build_to_pl_started_at = time.perf_counter()
                 try:
                     os.remove(self._queue_log_path(queue_file))
-                    self.log("Removed old queue log for fresh run")
+                    self.log("重新开始：已删除旧队列日志")
                 except FileNotFoundError:
                     pass
                 except Exception as e:
-                    self.log(f"WARN: remove old queue log failed: {e}")
-                self.set_stage("copying table to _Mod")
-                self.log("copying table to _Mod")
+                    self.log(f"WARN: 删除旧队列日志失败：{e}")
+                self.set_stage("重建 _Mod 表")
+                self.log("重新开始：准备重建 _Mod 表")
                 if mod_exists:
-                    drop = self.ui_call_blocking(lambda: messagebox.askyesno("_Mod exists", f"{schema}.{mod_table} already exists. Drop and recreate?"))
-                    if drop:
-                        with conn.cursor() as cur:
-                            cur.execute(f"DROP TABLE [{schema}].[{mod_table}]")
-                        conn.commit()
-                        mod_exists = False
-                    else:
-                        self.log("User canceled rebuild because _Mod exists")
-                        self.set_progress_indeterminate(False)
-                        return
+                    self.log(f"重新开始：删除已有结果表 {schema}.{mod_table}")
+                    with conn.cursor() as cur:
+                        cur.execute(f"DROP TABLE [{schema}].[{mod_table}]")
+                    conn.commit()
+                    mod_exists = False
                 if not mod_exists:
                     with conn.cursor() as cur:
                         cur.execute(f"SELECT * INTO [{schema}].[{mod_table}] FROM [{schema}].[{table}]")
                     conn.commit()
-                    self.log(f"Created {schema}.{mod_table}")
-                self.set_stage("validating required columns")
-                self.log("validating required columns")
+                    self.log(f"已创建结果表 {schema}.{mod_table}")
+                self.set_stage("校验必需字段")
+                self.log("校验必需字段")
                 colmap = self._validate_required_columns(conn, schema, mod_table)
-                self.set_stage("creating rowid / indexes")
-                self.log("creating rowid / indexes")
+                self.set_stage("创建 rowid / 索引")
+                self.log("创建 rowid / 索引")
                 self._ensure_mod_schema(conn, schema, mod_table, colmap)
                 _generate_queue(conn, colmap)
                 global_picked: Set[str] = set()
             else:
-                self.log("Resume mode: keep existing _Mod and queue")
-                self.set_stage("validating required columns")
-                self.log("validating required columns")
+                self.log("继续上次进度：保留现有 _Mod、队列和日志")
+                self.set_stage("校验必需字段")
+                self.log("校验必需字段")
                 colmap = self._validate_required_columns(conn, schema, mod_table)
-                self.set_stage("creating rowid / indexes")
-                self.log("creating rowid / indexes")
+                self.set_stage("创建 rowid / 索引")
+                self.log("创建 rowid / 索引")
                 self._ensure_mod_schema(conn, schema, mod_table, colmap)
                 if not queue_exists:
                     _generate_queue(conn, colmap)
-                self.set_stage("loading global picked (resume)")
-                self.log("loading global picked (resume)")
+                self.set_stage("加载续跑已选 SPN")
+                self.log("加载续跑已选 SPN")
                 with conn.cursor(as_dict=True) as cur:
                     cur.execute(f"SELECT DISTINCT [{colmap['SearchPartNumber']}] AS SearchPartNumber FROM [{schema}].[{mod_table}] WHERE [{colmap['ispick']}]=1")
                     global_picked = {_norm_text(r["SearchPartNumber"]) for r in cur.fetchall() if r.get("SearchPartNumber")}
