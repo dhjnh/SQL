@@ -1011,27 +1011,31 @@ def dedupe_by_spn(rows: List[RowScore]) -> int:
 def pick_ispick(rows: List[RowScore], global_picked_spn: Set[str]) -> None:
     for r in rows:
         r.row["_ispick"] = None
+        r.row["_spn_norm"] = _norm_text(r.row.get("SearchPartNumber"))
     tier1 = [r for r in rows if r.like >= 15 and not r.row.get("_dedup_drop") and r.domain_state == "HIT"]
     tier2 = [r for r in rows if r.like >= 15 and not r.row.get("_dedup_drop") and r.domain_state == "NEAR"]
     tier3 = [r for r in rows if r.like >= 10 and not r.row.get("_dedup_drop") and r.has_generic and not r.has_object and r.like <= 35]
 
     picked: List[RowScore] = []
+    picked_spn: Set[str] = set()
 
     def fill(pool: List[RowScore], allow_t3: bool = False):
         nonlocal picked
         pool = sorted(pool, key=lambda x: (x.like, x.score_desc, x.score_term, x.score_value), reverse=True)
         while pool and len(picked) < PL_PICK_MAX:
-            best_like = max(x.like for x in pool)
+            best_like = pool[0].like
             tolerance_floor = best_like - COVERAGE_LIKE_TOLERANCE
-            picked_spn = {_norm_text(x.row.get("SearchPartNumber")) for x in picked}
             candidate_pool = pool
             if COVERAGE_PRIORITY_ENABLED:
-                candidate_pool = [cand for cand in pool if cand.like >= tolerance_floor]
-                if not candidate_pool:
-                    candidate_pool = pool
+                candidate_end = len(pool)
+                for idx, cand in enumerate(pool):
+                    if cand.like < tolerance_floor:
+                        candidate_end = idx
+                        break
+                candidate_pool = pool[:candidate_end] or pool
 
             def _coverage_priority_tuple(cand: RowScore) -> Tuple[Any, ...]:
-                cand_spn = _norm_text(cand.row.get("SearchPartNumber"))
+                cand_spn = cand.row.get("_spn_norm", "")
                 global_unpicked = 0
                 same_pl_new = 0
                 if PREFER_GLOBAL_UNPICKED_SPN and cand_spn and cand_spn not in global_picked_spn:
@@ -1049,11 +1053,12 @@ def pick_ispick(rows: List[RowScore], global_picked_spn: Set[str]) -> None:
 
             choose = max(candidate_pool, key=_coverage_priority_tuple)
             pool.remove(choose)
-            choose_spn = _norm_text(choose.row.get("SearchPartNumber"))
+            choose_spn = choose.row.get("_spn_norm", "")
             if not allow_t3 and choose in tier3:
                 continue
             picked.append(choose)
             if choose_spn:
+                picked_spn.add(choose_spn)
                 global_picked_spn.add(choose_spn)
 
     fill(tier1)
