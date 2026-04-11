@@ -1025,7 +1025,6 @@ def pick_ispick(rows: List[RowScore], global_picked_spn: Set[str]) -> None:
         while pool and len(picked) < PL_PICK_MAX:
             best_like = pool[0].like
             tolerance_floor = best_like - COVERAGE_LIKE_TOLERANCE
-            candidate_pool = pool
             if COVERAGE_PRIORITY_ENABLED:
                 candidate_end = len(pool)
                 for idx, cand in enumerate(pool):
@@ -1033,6 +1032,8 @@ def pick_ispick(rows: List[RowScore], global_picked_spn: Set[str]) -> None:
                         candidate_end = idx
                         break
                 candidate_pool = pool[:candidate_end] or pool
+            else:
+                candidate_pool = pool[:1]
 
             def _coverage_priority_tuple(cand: RowScore) -> Tuple[Any, ...]:
                 cand_spn = cand.row.get("_spn_norm", "")
@@ -1043,12 +1044,12 @@ def pick_ispick(rows: List[RowScore], global_picked_spn: Set[str]) -> None:
                 if PREFER_NEW_SPN_IN_SAME_PL and cand_spn and cand_spn not in picked_spn:
                     same_pl_new = 1
                 return (
+                    global_unpicked,
+                    same_pl_new,
                     cand.like,
                     cand.score_desc,
                     cand.score_term,
                     cand.score_value,
-                    global_unpicked,
-                    same_pl_new,
                 )
 
             choose = max(candidate_pool, key=_coverage_priority_tuple)
