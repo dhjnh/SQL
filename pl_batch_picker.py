@@ -1057,6 +1057,8 @@ def pick_ispick(rows: List[RowScore], global_picked_spn: Set[str]) -> None:
             choose_spn = choose.row.get("_spn_norm", "")
             if not allow_t3 and choose in tier3:
                 continue
+            if choose_spn and choose_spn in picked_spn:
+                continue
             picked.append(choose)
             if choose_spn:
                 picked_spn.add(choose_spn)
